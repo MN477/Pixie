@@ -1,0 +1,7 @@
+__pycache__/
+venv1/
+hand_landmarker.task
+pose_landmarker_full.task
+face_landmarker.task
+*.csv
+yolov8n-pose.pt 
