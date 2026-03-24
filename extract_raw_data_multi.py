@@ -45,7 +45,7 @@ HANDS_OUTPUT       = "raw_hands_multi.csv"
 BLENDSHAPES_OUTPUT = "raw_blendshapes_multi.csv"
 
 # YOLO model
-YOLO_MODEL_PATH = "yolo26s.pt"
+YOLO_MODEL_PATH = "yolo11m.pt"
 
 # MediaPipe task files
 FACE_MODEL_PATH = "face_landmarker.task"
@@ -219,37 +219,67 @@ def main():
                 break
 
             # ── Step 1: YOLO detection + ByteTrack ────
+
             results = yolo_model.track(
-                frame,
+                source=frame,
                 tracker="bytetrack.yaml",
                 persist=True,
-                classes=[0],       # person class only
+                conf=0.25,   # lower = detect more people
+                iou=0.5,
+                classes=[0],  # person only
+                stream=False,
                 verbose=False,
             )
 
             boxes = results[0].boxes
+
             if boxes is None or len(boxes) == 0:
+                print(f"[DEBUG] No detections at frame {frame_id}")
                 frame_id += 1
                 continue
 
-            print("Boxes:", len(boxes))
-            print("Track IDs:", boxes.id)
+            # DEBUG: check tracking IDs
+            print(f"[DEBUG] Frame {frame_id} | Detections: {len(boxes)}")
+
+            if boxes.id is None:
+                print(f"[ERROR] No tracking IDs at frame {frame_id} — tracking NOT working")
+                frame_id += 1
+                continue  # DO NOT fallback to fake IDs anymore
+
 
             # Get bounding boxes and track IDs
             xyxy_list = boxes.xyxy.cpu().numpy().astype(int)
-            track_ids = (
-                boxes.id.cpu().numpy().astype(int)
-                if boxes.id is not None
-                else np.arange(len(xyxy_list))
-            )
+            track_ids = boxes.id.cpu().numpy().astype(int)
+            print(f"[DEBUG] Track IDs: {track_ids}")
+            debug_frame = frame.copy()
+
+            for bbox, track_id in zip(xyxy_list, track_ids):
+                x1, y1, x2, y2 = bbox
+                cv2.rectangle(debug_frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                cv2.putText(
+                    debug_frame,
+                    f"ID:{track_id}",
+                    (x1, y1 - 10),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.6,
+                    (0, 255, 0),
+                    2,
+                )
+
+            cv2.imshow("Tracking Debug", debug_frame)
+            cv2.waitKey(1)
 
             frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             frame_has_detections = False
 
             # ── Step 2-6: Process each detected person ─
+            print(f"[DEBUG] Processing {len(xyxy_list)} detections for frame {frame_id}")
+            processed_count = 0
+            
             for bbox, track_id in zip(xyxy_list, track_ids):
                 x1, y1, x2, y2 = bbox
                 tid = int(track_id)
+                print(f"[DEBUG] Processing track ID {tid} with bbox {bbox}")
 
                 # Expand, square, clip
                 cx1, cy1, cx2, cy2 = expand_and_square_bbox(
@@ -258,8 +288,10 @@ def main():
                 crop_w = cx2 - cx1
                 crop_h = cy2 - cy1
                 if crop_w < 10 or crop_h < 10:
+                    print(f"[DEBUG] Skipping track ID {tid} - crop too small: {crop_w}x{crop_h}")
                     continue  # skip tiny crops
 
+                print(f"[DEBUG] Crop for track ID {tid}: ({cx1},{cy1}) to ({cx2},{cy2}) size {crop_w}x{crop_h}")
                 crop = frame_rgb[cy1:cy2, cx1:cx2]
                 mp_image = mp.Image(
                     image_format=mp.ImageFormat.SRGB, data=np.ascontiguousarray(crop)
@@ -270,6 +302,8 @@ def main():
                     pose_result = pose_landmarker.detect(mp_image)
                     if pose_result and pose_result.pose_landmarks:
                         frame_has_detections = True
+                        processed_count += 1
+                        print(f"[DEBUG] Pose landmarks found for track ID {tid}")
                         for person_lm in pose_result.pose_landmarks:
                             for lm_idx, lm in enumerate(person_lm):
                                 gx, gy = remap_landmark(
@@ -280,6 +314,8 @@ def main():
                                     f"{gx:.8f}", f"{gy:.8f}", f"{lm.z:.8f}",
                                     f"{lm.visibility:.8f}", f"{lm.presence:.8f}",
                                 ])
+                    else:
+                        print(f"[DEBUG] No pose landmarks for track ID {tid}")
                 except Exception as e:
                     print(f"[WARN] Pose failed | frame {frame_id}, track {tid}: {e}")
 
@@ -347,6 +383,8 @@ def main():
             if frame_has_detections:
                 saved_frames += 1
 
+            print(f"[DEBUG] Frame {frame_id} summary: {len(xyxy_list)} detections, {processed_count} processed")
+            
             del frame, frame_rgb
             gc.collect()
 
