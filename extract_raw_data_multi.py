@@ -2,19 +2,25 @@
 extract_raw_data_multi.py
 =========================
 Multi-person landmark extraction using:
-  - YOLO26s + ByteTrack  → person detection & tracking
-  - MediaPipe Tasks API  → Pose, Face, Hand landmarking on per-person crops
+  - YOLO11m + ByteTrack  → person detection & tracking
+  - YOLOv8n-pose         → 17 COCO body keypoints per person
+  - YOLOv11m-face        → face bounding box detection
+  - 6DRepNet             → head pose (pitch, yaw, roll)
+  - OpenFace 2.2.0       → Action Units (runs in background thread)
 
 Pipeline per frame:
   1. YOLO detect + ByteTrack → bounding boxes with persistent track IDs
   2. For each person: expand bbox 20%, make square, crop
-  3. Run MediaPipe landmarkers on the crop
-  4. Remap normalised coords back to global frame
-  5. Write to CSV with track_id for identity persistence
+  3. YOLO-pose on body crop  → 17 keypoints → raw_body_multi.csv
+  4. YOLO-face on body crop  → face bbox (conf > 0.5)
+  5. Expand face bbox 25%, extract face sub-image → save to face_crops/
+  6. 6DRepNet on face crop   → pitch, yaw, roll → raw_head_pose_multi.csv
+  7. OpenFace processes batches of face crops in a background thread
+  8. Always write one row per person per frame (None if failed)
 
 Outputs:
-  raw_body.csv, raw_face.csv, raw_head_pose.csv,
-  raw_hands.csv, raw_blendshapes.csv
+  raw_body_multi.csv, raw_head_pose_multi.csv,
+  raw_action_units_multi.csv, face_crops/
 
 Usage:
     python extract_raw_data_multi.py
@@ -23,54 +29,65 @@ Usage:
 import csv
 import gc
 import os
+import re
+import shutil
+import subprocess
 import sys
-import urllib.request
+import threading
+import queue
 
 import cv2
 import numpy as np
-import mediapipe as mp
-from mediapipe.tasks import python
-from mediapipe.tasks.python import vision
+import torch
 from ultralytics import YOLO
+from sixdrepnet import SixDRepNet
 
 # ──────────────────────────────────────────────
 # CONFIGURATION
 # ──────────────────────────────────────────────
-INPUT_SOURCE ="testing_vid/2stud.mp4"
+INPUT_SOURCE = "testing_vid/HandRaise_019.mp4"
 
-BODY_OUTPUT        = "raw_body_multi.csv"
-FACE_OUTPUT        = "raw_face_multi.csv"
-HEAD_POSE_OUTPUT   = "raw_head_pose_multi.csv"
-HANDS_OUTPUT       = "raw_hands_multi.csv"
-BLENDSHAPES_OUTPUT = "raw_blendshapes_multi.csv"
+BODY_OUTPUT      = "raw_body_multi.csv"
+HEAD_POSE_OUTPUT = "raw_head_pose_multi.csv"
+AU_OUTPUT        = "raw_action_units_multi.csv"
+FACE_CROPS_DIR   = "face_crops"
+OPENFACE_OUT_DIR = "openface_output"
 
-# YOLO model
-YOLO_MODEL_PATH = "yolo11m.pt"
+# YOLO models
+YOLO_MODEL_PATH      = "yolo11m.pt"
+POSE_MODEL_PATH      = "yolov8n-pose.pt"
+FACE_YOLO_MODEL_PATH = "yolov11m-face.pt"
 
-# MediaPipe task files
-FACE_MODEL_PATH = "face_landmarker.task"
-HAND_MODEL_PATH = "hand_landmarker.task"
-POSE_MODEL_PATH = "pose_landmarker_full.task"
+# OpenFace
+OPENFACE_DIR = r"C:\Users\mouss\Documents\OpenFace_2.2.0_win_x86"
+OPENFACE_EXE = os.path.join(OPENFACE_DIR, "FaceLandmarkImg.exe")
 
-MODEL_URLS = {
-    FACE_MODEL_PATH: "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/latest/face_landmarker.task",
-    HAND_MODEL_PATH: "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/latest/hand_landmarker.task",
-    POSE_MODEL_PATH: "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_full/float16/latest/pose_landmarker_full.task",
-}
+# Processing settings
+EXPAND_RATIO = 0.20
+OPENFACE_BATCH_SIZE = 300  # process OpenFace every N face crops
 
-EXPAND_RATIO = 0.20  # expand bounding box by 20%
+# COCO 17 keypoint names (for reference)
+COCO_KEYPOINTS = [
+    "nose", "left_eye", "right_eye", "left_ear", "right_ear",
+    "left_shoulder", "right_shoulder", "left_elbow", "right_elbow",
+    "left_wrist", "right_wrist", "left_hip", "right_hip",
+    "left_knee", "right_knee", "left_ankle", "right_ankle",
+]
 
-# ──────────────────────────────────────────────
-# AUTO-DOWNLOAD MEDIAPIPE MODELS
-# ──────────────────────────────────────────────
-def ensure_model(path, url):
-    if not os.path.exists(path):
-        print(f"[INFO] Downloading {path}...")
-        urllib.request.urlretrieve(url, path)
-        print(f"[INFO] Saved {path} ({os.path.getsize(path) / 1e6:.1f} MB)")
+# AU columns output by OpenFace
+AU_INTENSITY_COLS = [
+    "AU01_r", "AU02_r", "AU04_r", "AU05_r", "AU06_r", "AU07_r",
+    "AU09_r", "AU10_r", "AU12_r", "AU14_r", "AU15_r", "AU17_r",
+    "AU20_r", "AU23_r", "AU25_r", "AU26_r", "AU45_r",
+]
+AU_BINARY_COLS = [
+    "AU01_c", "AU02_c", "AU04_c", "AU05_c", "AU06_c", "AU07_c",
+    "AU09_c", "AU10_c", "AU12_c", "AU14_c", "AU15_c", "AU17_c",
+    "AU20_c", "AU23_c", "AU25_c", "AU26_c", "AU28_c", "AU45_c",
+]
 
-for model_path, model_url in MODEL_URLS.items():
-    ensure_model(model_path, model_url)
+FILENAME_PATTERN = re.compile(r"frame_(\d+)_track_(\d+)")
+
 
 # ──────────────────────────────────────────────
 # HELPER FUNCTIONS
@@ -80,7 +97,6 @@ def expand_and_square_bbox(x1, y1, x2, y2, frame_h, frame_w, expand=EXPAND_RATIO
     w = x2 - x1
     h = y2 - y1
 
-    # Expand by the ratio
     pad_w = w * expand / 2
     pad_h = h * expand / 2
     x1 -= pad_w
@@ -88,7 +104,6 @@ def expand_and_square_bbox(x1, y1, x2, y2, frame_h, frame_w, expand=EXPAND_RATIO
     x2 += pad_w
     y2 += pad_h
 
-    # Make square (use the larger dimension)
     new_w = x2 - x1
     new_h = y2 - y1
     side = max(new_w, new_h)
@@ -99,7 +114,6 @@ def expand_and_square_bbox(x1, y1, x2, y2, frame_h, frame_w, expand=EXPAND_RATIO
     x2 = cx + side / 2
     y2 = cy + side / 2
 
-    # Clip to frame boundaries
     x1 = max(0, int(x1))
     y1 = max(0, int(y1))
     x2 = min(frame_w, int(x2))
@@ -108,91 +122,230 @@ def expand_and_square_bbox(x1, y1, x2, y2, frame_h, frame_w, expand=EXPAND_RATIO
     return x1, y1, x2, y2
 
 
-def remap_landmark(lm_x, lm_y, crop_x, crop_y, crop_w, crop_h):
-    """Convert normalised crop-local coords (0-1) to global pixel coords."""
-    gx = crop_x + lm_x * crop_w
-    gy = crop_y + lm_y * crop_h
-    return gx, gy
+# ──────────────────────────────────────────────
+# OPENFACE BACKGROUND WORKER
+# ──────────────────────────────────────────────
+class OpenFaceWorker:
+    """Background thread that processes batches of face crops through OpenFace."""
+
+    def __init__(self, face_crops_dir, openface_out_dir, batch_size=OPENFACE_BATCH_SIZE):
+        self.face_crops_dir = face_crops_dir
+        self.openface_out_dir = openface_out_dir
+        self.batch_size = batch_size
+        self.pending_crops = []       # list of filenames waiting
+        self.batch_count = 0
+        self.lock = threading.Lock()
+        self.task_queue = queue.Queue()
+        self.thread = threading.Thread(target=self._worker_loop, daemon=True)
+        self.total_processed = 0
+
+    def start(self):
+        """Start the background worker thread."""
+        os.makedirs(self.openface_out_dir, exist_ok=True)
+        self.thread.start()
+        print("[OpenFace] Background worker started")
+
+    def add_crop(self, filename):
+        """Add a face crop filename to the pending list. Triggers batch if full."""
+        with self.lock:
+            self.pending_crops.append(filename)
+            if len(self.pending_crops) >= self.batch_size:
+                batch = self.pending_crops.copy()
+                self.pending_crops.clear()
+                self.batch_count += 1
+                batch_id = self.batch_count
+                self.task_queue.put(("batch", batch_id, batch))
+
+    def flush_and_stop(self):
+        """Process any remaining crops and shut down the worker."""
+        with self.lock:
+            if self.pending_crops:
+                self.batch_count += 1
+                batch_id = self.batch_count
+                batch = self.pending_crops.copy()
+                self.pending_crops.clear()
+                self.task_queue.put(("batch", batch_id, batch))
+
+        # Signal the worker to stop
+        self.task_queue.put(("stop", None, None))
+        self.thread.join(timeout=600)  # wait up to 10 min for last batch
+        print(f"[OpenFace] Worker stopped. Total crops processed: {self.total_processed}")
+
+    def _worker_loop(self):
+        """Main loop of the background worker thread."""
+        while True:
+            action, batch_id, data = self.task_queue.get()
+            if action == "stop":
+                break
+            elif action == "batch":
+                self._process_batch(batch_id, data)
+
+    def _process_batch(self, batch_id, filenames):
+        """Process a batch: move crops to a temp subfolder, run OpenFace, move back."""
+        batch_dir = os.path.join(self.face_crops_dir, f"_batch_{batch_id}")
+        os.makedirs(batch_dir, exist_ok=True)
+
+        # Move crop files into the batch subfolder
+        for fname in filenames:
+            src = os.path.join(self.face_crops_dir, fname)
+            dst = os.path.join(batch_dir, fname)
+            if os.path.exists(src):
+                os.rename(src, dst)
+
+        # Run OpenFace on this batch folder
+        batch_out_dir = os.path.join(self.openface_out_dir, f"batch_{batch_id}")
+        os.makedirs(batch_out_dir, exist_ok=True)
+
+        cmd = [
+            OPENFACE_EXE,
+            "-fdir", os.path.abspath(batch_dir),
+            "-out_dir", os.path.abspath(batch_out_dir),
+            "-aus",
+            "-multi_view", "1",
+        ]
+
+        print(f"[OpenFace] Processing batch {batch_id} ({len(filenames)} crops)...")
+        try:
+            result = subprocess.run(
+                cmd, capture_output=True, text=True, cwd=OPENFACE_DIR, timeout=300
+            )
+            if result.returncode != 0:
+                print(f"[OpenFace] Batch {batch_id} warning: exit code {result.returncode}")
+            else:
+                print(f"[OpenFace] Batch {batch_id} complete")
+        except subprocess.TimeoutExpired:
+            print(f"[OpenFace] Batch {batch_id} timed out!")
+        except Exception as e:
+            print(f"[OpenFace] Batch {batch_id} error: {e}")
+
+        self.total_processed += len(filenames)
+
+        # Move crops back to main folder (so they're still available)
+        for fname in filenames:
+            src = os.path.join(batch_dir, fname)
+            dst = os.path.join(self.face_crops_dir, fname)
+            if os.path.exists(src):
+                os.rename(src, dst)
+
+        # Clean up empty batch dir
+        try:
+            os.rmdir(batch_dir)
+        except OSError:
+            pass
+
+
+# ──────────────────────────────────────────────
+# OPENFACE CSV MERGING
+# ──────────────────────────────────────────────
+def merge_openface_outputs(openface_out_dir, output_csv):
+    """Parse all OpenFace batch output CSVs and merge into one clean CSV."""
+    all_rows = []
+
+    # Walk through all batch subdirectories
+    for root, dirs, files in os.walk(openface_out_dir):
+        for csv_file in files:
+            if not csv_file.endswith(".csv"):
+                continue
+
+            csv_path = os.path.join(root, csv_file)
+            basename = os.path.splitext(csv_file)[0]
+            match = FILENAME_PATTERN.search(basename)
+            if not match:
+                continue
+
+            frame_id = int(match.group(1))
+            track_id = int(match.group(2))
+
+            with open(csv_path, "r", encoding="utf-8") as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    cleaned = {k.strip(): v.strip() for k, v in row.items()}
+                    confidence = float(cleaned.get("confidence", 0))
+                    success = int(cleaned.get("success", 0))
+
+                    out_row = {
+                        "frame_id": frame_id,
+                        "track_id": track_id,
+                        "confidence": f"{confidence:.4f}",
+                        "success": success,
+                    }
+
+                    if success:
+                        for au_col in AU_INTENSITY_COLS + AU_BINARY_COLS:
+                            out_row[au_col] = cleaned.get(au_col, "")
+                    else:
+                        for au_col in AU_INTENSITY_COLS + AU_BINARY_COLS:
+                            out_row[au_col] = ""
+
+                    all_rows.append(out_row)
+
+    all_rows.sort(key=lambda r: (r["frame_id"], r["track_id"]))
+
+    fieldnames = ["frame_id", "track_id", "confidence", "success"] + AU_INTENSITY_COLS + AU_BINARY_COLS
+
+    with open(output_csv, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(all_rows)
+
+    print(f"[OpenFace] Merged {len(all_rows)} rows → {output_csv}")
 
 
 # ──────────────────────────────────────────────
 # MODEL INITIALISATION
 # ──────────────────────────────────────────────
-print("[INFO] Loading YOLO26s model...")
+device = "cuda" if torch.cuda.is_available() else "cpu"
+print(f"[INFO] Using device: {device}")
+
+print("[INFO] Loading YOLO person detector...")
 yolo_model = YOLO(YOLO_MODEL_PATH)
+yolo_model.to(device)
 
-BaseOptions = python.BaseOptions
-VisionRunningMode = vision.RunningMode
+print("[INFO] Loading YOLO-pose model...")
+pose_model = YOLO(POSE_MODEL_PATH)
+pose_model.to(device)
 
-# Each crop has exactly one person, so num_* = 1 (hands = 2 for left+right)
-print("[INFO] Initializing MediaPipe Pose Landmarker...")
-pose_landmarker = vision.PoseLandmarker.create_from_options(
-    vision.PoseLandmarkerOptions(
-        base_options=BaseOptions(model_asset_path=POSE_MODEL_PATH),
-        running_mode=VisionRunningMode.IMAGE,
-        num_poses=1,
-    )
-)
+print("[INFO] Loading YOLO-face model...")
+face_det_model = YOLO(FACE_YOLO_MODEL_PATH)
+face_det_model.to(device)
 
-print("[INFO] Initializing MediaPipe Face Landmarker...")
-face_landmarker = vision.FaceLandmarker.create_from_options(
-    vision.FaceLandmarkerOptions(
-        base_options=BaseOptions(model_asset_path=FACE_MODEL_PATH),
-        running_mode=VisionRunningMode.IMAGE,
-        num_faces=1,
-        output_face_blendshapes=True,
-        output_facial_transformation_matrixes=True,
-    )
-)
+print("[INFO] Initializing 6DRepNet...")
+gpu_id = 0 if torch.cuda.is_available() else -1
+sixd_model = SixDRepNet(gpu_id=gpu_id)
 
-print("[INFO] Initializing MediaPipe Hand Landmarker...")
-hand_landmarker = vision.HandLandmarker.create_from_options(
-    vision.HandLandmarkerOptions(
-        base_options=BaseOptions(model_asset_path=HAND_MODEL_PATH),
-        running_mode=VisionRunningMode.IMAGE,
-        num_hands=2,
-    )
-)
+# ──────────────────────────────────────────────
+# CREATE DIRECTORIES
+# ──────────────────────────────────────────────
+os.makedirs(FACE_CROPS_DIR, exist_ok=True)
+os.makedirs(OPENFACE_OUT_DIR, exist_ok=True)
 
 # ──────────────────────────────────────────────
 # OPEN CSV FILES & WRITE HEADERS
 # ──────────────────────────────────────────────
 body_csv_file      = open(BODY_OUTPUT, "w", newline="", encoding="utf-8")
-face_csv_file      = open(FACE_OUTPUT, "w", newline="", encoding="utf-8")
 head_pose_csv_file = open(HEAD_POSE_OUTPUT, "w", newline="", encoding="utf-8")
-hands_csv_file     = open(HANDS_OUTPUT, "w", newline="", encoding="utf-8")
-blend_csv_file     = open(BLENDSHAPES_OUTPUT, "w", newline="", encoding="utf-8")
 
 body_writer      = csv.writer(body_csv_file)
-face_writer      = csv.writer(face_csv_file)
 head_pose_writer = csv.writer(head_pose_csv_file)
-hands_writer     = csv.writer(hands_csv_file)
-blend_writer     = csv.writer(blend_csv_file)
 
 body_writer.writerow([
-    "frame_id", "track_id", "landmark_idx", "x", "y", "z", "visibility", "presence"
-])
-face_writer.writerow([
-    "frame_id", "track_id", "landmark_idx", "x", "y", "z"
+    "frame_id", "track_id", "landmark_idx", "x", "y", "visibility"
 ])
 head_pose_writer.writerow([
-    "frame_id", "track_id",
-    "m00", "m01", "m02", "m03",
-    "m10", "m11", "m12", "m13",
-    "m20", "m21", "m22", "m23",
-    "m30", "m31", "m32", "m33",
-])
-hands_writer.writerow([
-    "frame_id", "track_id", "hand_label", "landmark_idx", "x", "y", "z"
-])
-blend_writer.writerow([
-    "frame_id", "track_id", "blendshape_name", "score"
+    "frame_id", "track_id", "pitch", "yaw", "roll"
 ])
 
 # ──────────────────────────────────────────────
 # MAIN LOOP
 # ──────────────────────────────────────────────
 def main():
+    # Verify OpenFace is available
+    if not os.path.isfile(OPENFACE_EXE):
+        print(f"[WARN] OpenFace not found at {OPENFACE_EXE} — AU extraction will be skipped")
+        openface_available = False
+    else:
+        openface_available = True
+
     if not os.path.isfile(INPUT_SOURCE):
         print(f"[ERROR] Video file not found: {INPUT_SOURCE}")
         sys.exit(1)
@@ -207,6 +360,12 @@ def main():
     frame_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     print(f"[INFO] Video: {frame_w}x{frame_h}, {total_frames} frames.")
 
+    # Start OpenFace background worker
+    of_worker = None
+    if openface_available:
+        of_worker = OpenFaceWorker(FACE_CROPS_DIR, OPENFACE_OUT_DIR)
+        of_worker.start()
+
     frame_id = 0
     saved_frames = 0
     print("[INFO] Starting extraction loop...")
@@ -218,15 +377,14 @@ def main():
                 print("[INFO] End of video stream.")
                 break
 
-            # ── Step 1: YOLO detection + ByteTrack ────
-
+            # ── Step 1: YOLO person detection + ByteTrack ──
             results = yolo_model.track(
                 source=frame,
                 tracker="bytetrack.yaml",
                 persist=True,
-                conf=0.25,   # lower = detect more people
+                conf=0.25,
                 iou=0.5,
-                classes=[0],  # person only
+                classes=[0],
                 stream=False,
                 verbose=False,
             )
@@ -238,162 +396,149 @@ def main():
                 frame_id += 1
                 continue
 
-            # DEBUG: check tracking IDs
             print(f"[DEBUG] Frame {frame_id} | Detections: {len(boxes)}")
 
             if boxes.id is None:
                 print(f"[ERROR] No tracking IDs at frame {frame_id} — tracking NOT working")
                 frame_id += 1
-                continue  # DO NOT fallback to fake IDs anymore
+                continue
 
-
-            # Get bounding boxes and track IDs
             xyxy_list = boxes.xyxy.cpu().numpy().astype(int)
             track_ids = boxes.id.cpu().numpy().astype(int)
             print(f"[DEBUG] Track IDs: {track_ids}")
-            debug_frame = frame.copy()
 
+            # Debug visualisation
+            debug_frame = frame.copy()
             for bbox, track_id in zip(xyxy_list, track_ids):
                 x1, y1, x2, y2 = bbox
                 cv2.rectangle(debug_frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
                 cv2.putText(
-                    debug_frame,
-                    f"ID:{track_id}",
-                    (x1, y1 - 10),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.6,
-                    (0, 255, 0),
-                    2,
+                    debug_frame, f"ID:{track_id}",
+                    (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.6, (0, 255, 0), 2,
                 )
-
             cv2.imshow("Tracking Debug", debug_frame)
             cv2.waitKey(1)
 
-            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             frame_has_detections = False
-
-            # ── Step 2-6: Process each detected person ─
-            print(f"[DEBUG] Processing {len(xyxy_list)} detections for frame {frame_id}")
             processed_count = 0
-            
+
+            print(f"[DEBUG] Processing {len(xyxy_list)} detections for frame {frame_id}")
+
             for bbox, track_id in zip(xyxy_list, track_ids):
                 x1, y1, x2, y2 = bbox
                 tid = int(track_id)
                 print(f"[DEBUG] Processing track ID {tid} with bbox {bbox}")
 
-                # Expand, square, clip
+                # Step 2: Expand, square, clip
                 cx1, cy1, cx2, cy2 = expand_and_square_bbox(
                     x1, y1, x2, y2, frame_h, frame_w
                 )
                 crop_w = cx2 - cx1
                 crop_h = cy2 - cy1
                 if crop_w < 10 or crop_h < 10:
-                    print(f"[DEBUG] Skipping track ID {tid} - crop too small: {crop_w}x{crop_h}")
-                    continue  # skip tiny crops
+                    print(f"[DEBUG] Skipping track ID {tid} - crop too small")
+                    body_writer.writerow([frame_id, tid, None, None, None, None])
+                    head_pose_writer.writerow([frame_id, tid, None, None, None])
+                    continue
 
-                print(f"[DEBUG] Crop for track ID {tid}: ({cx1},{cy1}) to ({cx2},{cy2}) size {crop_w}x{crop_h}")
-                crop = frame_rgb[cy1:cy2, cx1:cx2]
-                mp_image = mp.Image(
-                    image_format=mp.ImageFormat.SRGB, data=np.ascontiguousarray(crop)
-                )
+                crop_bgr = frame[cy1:cy2, cx1:cx2]
 
-                # ── Pose (Body) ───────────────────────
+                # ── Step 3: YOLO-pose → 17 keypoints ──
                 try:
-                    pose_result = pose_landmarker.detect(mp_image)
-                    if pose_result and pose_result.pose_landmarks:
+                    pose_results = pose_model(crop_bgr, verbose=False)
+                    if (pose_results and len(pose_results) > 0
+                            and pose_results[0].keypoints is not None
+                            and pose_results[0].keypoints.data is not None
+                            and len(pose_results[0].keypoints.data) > 0):
+
                         frame_has_detections = True
                         processed_count += 1
-                        print(f"[DEBUG] Pose landmarks found for track ID {tid}")
-                        for person_lm in pose_result.pose_landmarks:
-                            for lm_idx, lm in enumerate(person_lm):
-                                gx, gy = remap_landmark(
-                                    lm.x, lm.y, cx1, cy1, crop_w, crop_h
-                                )
-                                body_writer.writerow([
-                                    frame_id, tid, lm_idx,
-                                    f"{gx:.8f}", f"{gy:.8f}", f"{lm.z:.8f}",
-                                    f"{lm.visibility:.8f}", f"{lm.presence:.8f}",
-                                ])
+                        kpts = pose_results[0].keypoints.data[0].cpu().numpy()
+
+                        for lm_idx in range(kpts.shape[0]):
+                            global_x = cx1 + kpts[lm_idx, 0]
+                            global_y = cy1 + kpts[lm_idx, 1]
+                            vis = kpts[lm_idx, 2]
+                            body_writer.writerow([
+                                frame_id, tid, lm_idx,
+                                f"{global_x:.4f}", f"{global_y:.4f}", f"{vis:.4f}",
+                            ])
                     else:
-                        print(f"[DEBUG] No pose landmarks for track ID {tid}")
+                        body_writer.writerow([frame_id, tid, None, None, None, None])
                 except Exception as e:
                     print(f"[WARN] Pose failed | frame {frame_id}, track {tid}: {e}")
+                    body_writer.writerow([frame_id, tid, None, None, None, None])
 
-                # ── Face + Head Pose + Blendshapes ────
+                # ── Step 4: YOLO-face → face bbox ──
                 try:
-                    face_result = face_landmarker.detect(mp_image)
-                    if face_result and face_result.face_landmarks:
-                        frame_has_detections = True
-                        for face_lm in face_result.face_landmarks:
-                            for lm_idx, lm in enumerate(face_lm):
-                                gx, gy = remap_landmark(
-                                    lm.x, lm.y, cx1, cy1, crop_w, crop_h
-                                )
-                                face_writer.writerow([
-                                    frame_id, tid, lm_idx,
-                                    f"{gx:.8f}", f"{gy:.8f}", f"{lm.z:.8f}",
-                                ])
+                    face_results = face_det_model(crop_bgr, verbose=False)
+                    face_boxes = face_results[0].boxes if len(face_results) > 0 else None
 
-                        # Head pose (transformation matrix)
-                        if face_result.facial_transformation_matrixes:
-                            for matrix in face_result.facial_transformation_matrixes:
-                                m = np.array(matrix).flatten()
-                                head_pose_writer.writerow([
-                                    frame_id, tid,
-                                    *[f"{v:.8f}" for v in m],
-                                ])
+                    best_face = None
+                    if face_boxes is not None and len(face_boxes) > 0:
+                        confidences = face_boxes.conf.cpu().numpy()
+                        max_conf_idx = np.argmax(confidences)
+                        if confidences[max_conf_idx] > 0.5:
+                            best_face = face_boxes.xyxy.cpu().numpy()[max_conf_idx].astype(int)
 
-                        # Blendshapes
-                        if face_result.face_blendshapes:
-                            for blend_list in face_result.face_blendshapes:
-                                for bs in blend_list:
-                                    blend_writer.writerow([
-                                        frame_id, tid,
-                                        bs.category_name,
-                                        f"{bs.score:.8f}",
-                                    ])
+                    if best_face is None:
+                        head_pose_writer.writerow([frame_id, tid, None, None, None])
+                        continue
+
+                    fx1, fy1, fx2, fy2 = best_face
+
+                    # ── Step 5: Expand face 25%, save crop ──
+                    fw = fx2 - fx1
+                    fh = fy2 - fy1
+                    pad_w = fw * 0.25
+                    pad_h = fh * 0.25
+
+                    cf1 = max(0, int(fx1 - pad_w))
+                    cf2 = max(0, int(fy1 - pad_h))
+                    cf3 = min(crop_w, int(fx2 + pad_w))
+                    cf4 = min(crop_h, int(fy2 + pad_h))
+
+                    face_crop_bgr = crop_bgr[cf2:cf4, cf1:cf3]
+
+                    if face_crop_bgr.shape[0] < 10 or face_crop_bgr.shape[1] < 10:
+                        head_pose_writer.writerow([frame_id, tid, None, None, None])
+                        continue
+
+                    # Save face crop for OpenFace
+                    face_crop_filename = f"frame_{frame_id:06d}_track_{tid}.jpg"
+                    face_crop_path = os.path.join(FACE_CROPS_DIR, face_crop_filename)
+                    cv2.imwrite(face_crop_path, face_crop_bgr)
+
+                    # Queue for OpenFace background processing
+                    if of_worker:
+                        of_worker.add_crop(face_crop_filename)
+
+                    # ── Step 6: 6DRepNet → pitch, yaw, roll ──
+                    pitch, yaw, roll = sixd_model.predict(face_crop_bgr)
+                    p_val = float(np.ravel(pitch)[0])
+                    y_val = float(np.ravel(yaw)[0])
+                    r_val = float(np.ravel(roll)[0])
+
+                    head_pose_writer.writerow([
+                        frame_id, tid,
+                        f"{p_val:.4f}", f"{y_val:.4f}", f"{r_val:.4f}"
+                    ])
+
                 except Exception as e:
-                    print(f"[WARN] Face failed | frame {frame_id}, track {tid}: {e}")
+                    print(f"[WARN] Face/HeadPose failed | frame {frame_id}, track {tid}: {e}")
+                    head_pose_writer.writerow([frame_id, tid, None, None, None])
 
-                # ── Hands ─────────────────────────────
-                try:
-                    hand_result = hand_landmarker.detect(mp_image)
-                    if hand_result and hand_result.hand_landmarks:
-                        frame_has_detections = True
-                        for hand_idx, hand_lm in enumerate(hand_result.hand_landmarks):
-                            hand_label = "unknown"
-                            if (hand_result.handedness
-                                    and hand_idx < len(hand_result.handedness)):
-                                hand_label = (
-                                    hand_result.handedness[hand_idx][0]
-                                    .category_name.lower()
-                                )
-                            for lm_idx, lm in enumerate(hand_lm):
-                                gx, gy = remap_landmark(
-                                    lm.x, lm.y, cx1, cy1, crop_w, crop_h
-                                )
-                                hands_writer.writerow([
-                                    frame_id, tid, hand_label, lm_idx,
-                                    f"{gx:.8f}", f"{gy:.8f}", f"{lm.z:.8f}",
-                                ])
-                except Exception as e:
-                    print(f"[WARN] Hand failed | frame {frame_id}, track {tid}: {e}")
-
-            # ── Housekeeping ──────────────────────────
+            # ── Housekeeping ──
             if frame_has_detections:
                 saved_frames += 1
 
-            print(f"[DEBUG] Frame {frame_id} summary: {len(xyxy_list)} detections, {processed_count} processed")
-            
-            del frame, frame_rgb
+            del frame
             gc.collect()
 
             if frame_id % 100 == 0 and frame_id > 0:
                 body_csv_file.flush()
-                face_csv_file.flush()
                 head_pose_csv_file.flush()
-                hands_csv_file.flush()
-                blend_csv_file.flush()
                 print(
                     f"[INFO] Processed {frame_id}/{total_frames} frames "
                     f"({saved_frames} with detections)..."
@@ -407,22 +552,33 @@ def main():
     finally:
         cap.release()
 
-        pose_landmarker.close()
-        face_landmarker.close()
-        hand_landmarker.close()
-
         body_csv_file.close()
-        face_csv_file.close()
         head_pose_csv_file.close()
-        hands_csv_file.close()
-        blend_csv_file.close()
 
-        print(f"[INFO] Done. {frame_id} total frames, {saved_frames} with detections.")
+        print(f"[INFO] Extraction done. {frame_id} total frames, {saved_frames} with detections.")
         print(f"  → {BODY_OUTPUT}")
-        print(f"  → {FACE_OUTPUT}")
         print(f"  → {HEAD_POSE_OUTPUT}")
-        print(f"  → {HANDS_OUTPUT}")
-        print(f"  → {BLENDSHAPES_OUTPUT}")
+
+        # ── Wait for OpenFace to finish remaining batches ──
+        if of_worker:
+            print("[INFO] Waiting for OpenFace background worker to finish...")
+            of_worker.flush_and_stop()
+
+            # ── Merge all OpenFace outputs into final CSV ──
+            print("[INFO] Merging OpenFace outputs...")
+            merge_openface_outputs(OPENFACE_OUT_DIR, AU_OUTPUT)
+            print(f"  → {AU_OUTPUT}")
+
+        print("[INFO] All done!")
+
+        # ── Cleanup: delete face crops and OpenFace temp output ──
+        print("[INFO] Cleaning up temporary files...")
+        if os.path.isdir(FACE_CROPS_DIR):
+            shutil.rmtree(FACE_CROPS_DIR, ignore_errors=True)
+            print(f"  ✓ Deleted {FACE_CROPS_DIR}/")
+        if os.path.isdir(OPENFACE_OUT_DIR):
+            shutil.rmtree(OPENFACE_OUT_DIR, ignore_errors=True)
+            print(f"  ✓ Deleted {OPENFACE_OUT_DIR}/")
 
 
 if __name__ == "__main__":
