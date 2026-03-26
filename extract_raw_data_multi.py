@@ -46,7 +46,7 @@ from sixdrepnet import SixDRepNet
 # ──────────────────────────────────────────────
 # CONFIGURATION
 # ──────────────────────────────────────────────
-INPUT_SOURCE = "testing_vid/HandRaise_019.mp4"
+INPUT_SOURCE = "testing_vid/2stud.mp4"
 
 BODY_OUTPUT      = "raw_body_multi.csv"
 HEAD_POSE_OUTPUT = "raw_head_pose_multi.csv"
