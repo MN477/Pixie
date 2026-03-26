@@ -1,26 +1,27 @@
 """
 extract_raw_data_multi.py
 =========================
-Multi-person landmark extraction using:
-  - YOLO11m + ByteTrack  → person detection & tracking
-  - YOLOv8n-pose         → 17 COCO body keypoints per person
-  - YOLOv11m-face        → face bounding box detection
-  - 6DRepNet             → head pose (pitch, yaw, roll)
-  - OpenFace 2.2.0       → Action Units (runs in background thread)
+Multi-person landmark extraction — optimized for low latency.
+
+Key optimizations vs. original:
+  1. Merged detection + pose: YOLOv8-pose.track() does person detection,
+     ByteTrack tracking, AND 17-keypoint extraction in ONE model call.
+     Eliminates YOLO11m entirely.
+  2. Frame stride: process every Nth frame (configurable).
+  3. Inference resolution cap: YOLO infers at fixed lower res (e.g. 480px).
 
 Pipeline per frame:
-  1. YOLO detect + ByteTrack → bounding boxes with persistent track IDs
-  2. For each person: expand bbox 20%, make square, crop
-  3. YOLO-pose on body crop  → 17 keypoints → raw_body_multi.csv
-  4. YOLO-face on body crop  → face bbox (conf > 0.5)
-  5. Expand face bbox 25%, extract face sub-image → save to face_crops/
-  6. 6DRepNet on face crop   → pitch, yaw, roll → raw_head_pose_multi.csv
-  7. OpenFace processes batches of face crops in a background thread
-  8. Always write one row per person per frame (None if failed)
+  1. YOLOv8-pose.track(frame) → bboxes + track IDs + 17 keypoints
+  2. Write body keypoints to CSV (full-frame coords, no remapping)
+  3. For each person: extract body crop from bbox
+  4. YOLO-face on body crop → face bbox (conf > 0.5)
+  5. Expand face 25%, save crop, queue for OpenFace
+  6. 6DRepNet on face crop → pitch, yaw, roll → CSV
+  7. OpenFace processes face crops in background thread
 
 Outputs:
   raw_body_multi.csv, raw_head_pose_multi.csv,
-  raw_action_units_multi.csv, face_crops/
+  raw_action_units_multi.csv, raw_gaze_multi.csv, face_crops/
 
 Usage:
     python extract_raw_data_multi.py
@@ -29,13 +30,13 @@ Usage:
 import csv
 import gc
 import os
+import queue
 import re
 import shutil
 import subprocess
 import sys
 import threading
 import time
-import queue
 
 import cv2
 import numpy as np
@@ -55,8 +56,7 @@ GAZE_OUTPUT      = "raw_gaze_multi.csv"
 FACE_CROPS_DIR   = "face_crops"
 OPENFACE_OUT_DIR = "openface_output"
 
-# YOLO models
-YOLO_MODEL_PATH      = "yolo11m.pt"
+# Models (YOLO11m removed — YOLOv8-pose handles detection + tracking + pose)
 POSE_MODEL_PATH      = "yolov8n-pose.pt"
 FACE_YOLO_MODEL_PATH = "yolov11m-face.pt"
 
@@ -64,11 +64,13 @@ FACE_YOLO_MODEL_PATH = "yolov11m-face.pt"
 OPENFACE_DIR = r"C:\Users\mouss\Documents\OpenFace_2.2.0_win_x86"
 OPENFACE_EXE = os.path.join(OPENFACE_DIR, "FaceLandmarkImg.exe")
 
-# Processing settings
-EXPAND_RATIO = 0.20
-OPENFACE_BATCH_SIZE = 300  # process OpenFace every N face crops
+# ── Performance tuning ──
+FRAME_STRIDE        = 1     # process every Nth frame (1 = all, 2 = half, etc.)
+INFERENCE_SIZE      = 480   # YOLO inference resolution (lower = faster)
+EXPAND_RATIO        = 0.20  # body bbox expansion for face detection crop
+OPENFACE_BATCH_SIZE = 300   # OpenFace batch trigger size
 
-# COCO 17 keypoint names (for reference)
+# COCO 17 keypoint names
 COCO_KEYPOINTS = [
     "nose", "left_eye", "right_eye", "left_ear", "right_ear",
     "left_shoulder", "right_shoulder", "left_elbow", "right_elbow",
@@ -101,32 +103,22 @@ FILENAME_PATTERN = re.compile(r"frame_(\d+)_track_(\d+)")
 # ──────────────────────────────────────────────
 # HELPER FUNCTIONS
 # ──────────────────────────────────────────────
-def expand_and_square_bbox(x1, y1, x2, y2, frame_h, frame_w, expand=EXPAND_RATIO):
-    """Expand a bounding box by `expand` ratio, make it square, and clip to frame."""
+def get_device():
+    """Auto-detect GPU, fall back to CPU."""
+    return "cuda" if torch.cuda.is_available() else "cpu"
+
+
+def expand_bbox(x1, y1, x2, y2, frame_h, frame_w, expand=EXPAND_RATIO):
+    """Expand a bounding box by `expand` ratio and clip to frame bounds."""
     w = x2 - x1
     h = y2 - y1
-
     pad_w = w * expand / 2
     pad_h = h * expand / 2
-    x1 -= pad_w
-    y1 -= pad_h
-    x2 += pad_w
-    y2 += pad_h
 
-    new_w = x2 - x1
-    new_h = y2 - y1
-    side = max(new_w, new_h)
-    cx = (x1 + x2) / 2
-    cy = (y1 + y2) / 2
-    x1 = cx - side / 2
-    y1 = cy - side / 2
-    x2 = cx + side / 2
-    y2 = cy + side / 2
-
-    x1 = max(0, int(x1))
-    y1 = max(0, int(y1))
-    x2 = min(frame_w, int(x2))
-    y2 = min(frame_h, int(y2))
+    x1 = max(0, int(x1 - pad_w))
+    y1 = max(0, int(y1 - pad_h))
+    x2 = min(frame_w, int(x2 + pad_w))
+    y2 = min(frame_h, int(y2 + pad_h))
 
     return x1, y1, x2, y2
 
@@ -141,7 +133,7 @@ class OpenFaceWorker:
         self.face_crops_dir = face_crops_dir
         self.openface_out_dir = openface_out_dir
         self.batch_size = batch_size
-        self.pending_crops = []       # list of filenames waiting
+        self.pending_crops = []
         self.batch_count = 0
         self.lock = threading.Lock()
         self.task_queue = queue.Queue()
@@ -149,13 +141,11 @@ class OpenFaceWorker:
         self.total_processed = 0
 
     def start(self):
-        """Start the background worker thread."""
         os.makedirs(self.openface_out_dir, exist_ok=True)
         self.thread.start()
         print("[OpenFace] Background worker started")
 
     def add_crop(self, filename):
-        """Add a face crop filename to the pending list. Triggers batch if full."""
         with self.lock:
             self.pending_crops.append(filename)
             if len(self.pending_crops) >= self.batch_size:
@@ -166,7 +156,6 @@ class OpenFaceWorker:
                 self.task_queue.put(("batch", batch_id, batch))
 
     def flush_and_stop(self):
-        """Process any remaining crops and shut down the worker."""
         with self.lock:
             if self.pending_crops:
                 self.batch_count += 1
@@ -174,14 +163,11 @@ class OpenFaceWorker:
                 batch = self.pending_crops.copy()
                 self.pending_crops.clear()
                 self.task_queue.put(("batch", batch_id, batch))
-
-        # Signal the worker to stop
         self.task_queue.put(("stop", None, None))
-        self.thread.join(timeout=600)  # wait up to 10 min for last batch
+        self.thread.join(timeout=600)
         print(f"[OpenFace] Worker stopped. Total crops processed: {self.total_processed}")
 
     def _worker_loop(self):
-        """Main loop of the background worker thread."""
         while True:
             action, batch_id, data = self.task_queue.get()
             if action == "stop":
@@ -190,18 +176,15 @@ class OpenFaceWorker:
                 self._process_batch(batch_id, data)
 
     def _process_batch(self, batch_id, filenames):
-        """Process a batch: move crops to a temp subfolder, run OpenFace, move back."""
         batch_dir = os.path.join(self.face_crops_dir, f"_batch_{batch_id}")
         os.makedirs(batch_dir, exist_ok=True)
 
-        # Move crop files into the batch subfolder
         for fname in filenames:
             src = os.path.join(self.face_crops_dir, fname)
             dst = os.path.join(batch_dir, fname)
             if os.path.exists(src):
                 os.rename(src, dst)
 
-        # Run OpenFace on this batch folder
         batch_out_dir = os.path.join(self.openface_out_dir, f"batch_{batch_id}")
         os.makedirs(batch_out_dir, exist_ok=True)
 
@@ -230,14 +213,12 @@ class OpenFaceWorker:
 
         self.total_processed += len(filenames)
 
-        # Move crops back to main folder (so they're still available)
         for fname in filenames:
             src = os.path.join(batch_dir, fname)
             dst = os.path.join(self.face_crops_dir, fname)
             if os.path.exists(src):
                 os.rename(src, dst)
 
-        # Clean up empty batch dir
         try:
             os.rmdir(batch_dir)
         except OSError:
@@ -252,7 +233,6 @@ def merge_openface_outputs(openface_out_dir, au_csv, gaze_csv):
     au_rows = []
     gaze_rows = []
 
-    # Walk through all batch subdirectories
     for root, dirs, files in os.walk(openface_out_dir):
         for csv_file in files:
             if not csv_file.endswith(".csv"):
@@ -272,9 +252,6 @@ def merge_openface_outputs(openface_out_dir, au_csv, gaze_csv):
                 for row in reader:
                     cleaned = {k.strip(): v.strip() for k, v in row.items()}
                     confidence = float(cleaned.get("confidence", 0))
-                    
-                    # FaceLandmarkImg.exe single-image mode sometimes omits 'success'
-                    # Default to 1 (success) because YOLO already guaranteed a face crop.
                     success_val = cleaned.get("success")
                     success = int(success_val) if success_val is not None else 1
 
@@ -326,14 +303,10 @@ def merge_openface_outputs(openface_out_dir, au_csv, gaze_csv):
 # ──────────────────────────────────────────────
 # MODEL INITIALISATION
 # ──────────────────────────────────────────────
-device = "cuda" if torch.cuda.is_available() else "cpu"
+device = get_device()
 print(f"[INFO] Using device: {device}")
 
-print("[INFO] Loading YOLO person detector...")
-yolo_model = YOLO(YOLO_MODEL_PATH)
-yolo_model.to(device)
-
-print("[INFO] Loading YOLO-pose model...")
+print("[INFO] Loading YOLOv8-pose (detection + tracking + pose)...")
 pose_model = YOLO(POSE_MODEL_PATH)
 pose_model.to(device)
 
@@ -379,7 +352,7 @@ head_pose_writer.writerow([
 def main():
     start_time = time.time()
 
-    # Verify OpenFace is available
+    # Verify OpenFace
     if not os.path.isfile(OPENFACE_EXE):
         print(f"[WARN] OpenFace not found at {OPENFACE_EXE} — AU extraction will be skipped")
         openface_available = False
@@ -399,6 +372,7 @@ def main():
     frame_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     frame_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     print(f"[INFO] Video: {frame_w}x{frame_h}, {total_frames} frames.")
+    print(f"[INFO] Frame stride: {FRAME_STRIDE} | Inference size: {INFERENCE_SIZE}px")
 
     # Start OpenFace background worker
     of_worker = None
@@ -407,7 +381,7 @@ def main():
         of_worker.start()
 
     frame_id = 0
-    saved_frames = 0
+    processed_frames = 0
     print("[INFO] Starting extraction loop...")
 
     try:
@@ -417,35 +391,44 @@ def main():
                 print("[INFO] End of video stream.")
                 break
 
-            # ── Step 1: YOLO person detection + ByteTrack ──
-            results = yolo_model.track(
+            # ── Frame stride: skip frames ──
+            if frame_id % FRAME_STRIDE != 0:
+                frame_id += 1
+                continue
+
+            # ── Step 1: YOLOv8-pose + ByteTrack (detection + tracking + keypoints in ONE call) ──
+            results = pose_model.track(
                 source=frame,
                 tracker="bytetrack.yaml",
                 persist=True,
                 conf=0.25,
                 iou=0.5,
                 classes=[0],
+                imgsz=INFERENCE_SIZE,
                 stream=False,
                 verbose=False,
             )
 
             boxes = results[0].boxes
+            keypoints_data = results[0].keypoints
 
             if boxes is None or len(boxes) == 0:
-                print(f"[DEBUG] No detections at frame {frame_id}")
                 frame_id += 1
                 continue
 
-            print(f"[DEBUG] Frame {frame_id} | Detections: {len(boxes)}")
-
             if boxes.id is None:
-                print(f"[ERROR] No tracking IDs at frame {frame_id} — tracking NOT working")
                 frame_id += 1
                 continue
 
             xyxy_list = boxes.xyxy.cpu().numpy().astype(int)
             track_ids = boxes.id.cpu().numpy().astype(int)
-            print(f"[DEBUG] Track IDs: {track_ids}")
+
+            # Get all keypoints (shape: [N, 17, 3])
+            all_kpts = None
+            if (keypoints_data is not None
+                    and keypoints_data.data is not None
+                    and len(keypoints_data.data) > 0):
+                all_kpts = keypoints_data.data.cpu().numpy()
 
             # Debug visualisation
             debug_frame = frame.copy()
@@ -460,57 +443,37 @@ def main():
             cv2.imshow("Tracking Debug", debug_frame)
             cv2.waitKey(1)
 
-            frame_has_detections = False
-            processed_count = 0
-
-            print(f"[DEBUG] Processing {len(xyxy_list)} detections for frame {frame_id}")
-
-            for bbox, track_id in zip(xyxy_list, track_ids):
+            # ── Process each detected person ──
+            for person_idx, (bbox, track_id) in enumerate(zip(xyxy_list, track_ids)):
                 x1, y1, x2, y2 = bbox
                 tid = int(track_id)
-                print(f"[DEBUG] Processing track ID {tid} with bbox {bbox}")
 
-                # Step 2: Expand, square, clip
-                cx1, cy1, cx2, cy2 = expand_and_square_bbox(
+                # ── Step 2: Write body keypoints (already in full-frame coords) ──
+                if all_kpts is not None and person_idx < len(all_kpts):
+                    kpts = all_kpts[person_idx]  # shape: [17, 3]
+                    for lm_idx in range(kpts.shape[0]):
+                        body_writer.writerow([
+                            frame_id, tid, lm_idx,
+                            f"{kpts[lm_idx, 0]:.4f}",
+                            f"{kpts[lm_idx, 1]:.4f}",
+                            f"{kpts[lm_idx, 2]:.4f}",
+                        ])
+                else:
+                    body_writer.writerow([frame_id, tid, None, None, None, None])
+
+                # ── Step 3: Extract body crop for face detection ──
+                cx1, cy1, cx2, cy2 = expand_bbox(
                     x1, y1, x2, y2, frame_h, frame_w
                 )
                 crop_w = cx2 - cx1
                 crop_h = cy2 - cy1
                 if crop_w < 10 or crop_h < 10:
-                    print(f"[DEBUG] Skipping track ID {tid} - crop too small")
-                    body_writer.writerow([frame_id, tid, None, None, None, None])
                     head_pose_writer.writerow([frame_id, tid, None, None, None])
                     continue
 
                 crop_bgr = frame[cy1:cy2, cx1:cx2]
 
-                # ── Step 3: YOLO-pose → 17 keypoints ──
-                try:
-                    pose_results = pose_model(crop_bgr, verbose=False)
-                    if (pose_results and len(pose_results) > 0
-                            and pose_results[0].keypoints is not None
-                            and pose_results[0].keypoints.data is not None
-                            and len(pose_results[0].keypoints.data) > 0):
-
-                        frame_has_detections = True
-                        processed_count += 1
-                        kpts = pose_results[0].keypoints.data[0].cpu().numpy()
-
-                        for lm_idx in range(kpts.shape[0]):
-                            global_x = cx1 + kpts[lm_idx, 0]
-                            global_y = cy1 + kpts[lm_idx, 1]
-                            vis = kpts[lm_idx, 2]
-                            body_writer.writerow([
-                                frame_id, tid, lm_idx,
-                                f"{global_x:.4f}", f"{global_y:.4f}", f"{vis:.4f}",
-                            ])
-                    else:
-                        body_writer.writerow([frame_id, tid, None, None, None, None])
-                except Exception as e:
-                    print(f"[WARN] Pose failed | frame {frame_id}, track {tid}: {e}")
-                    body_writer.writerow([frame_id, tid, None, None, None, None])
-
-                # ── Step 4: YOLO-face → face bbox ──
+                # ── Step 4: YOLO-face on body crop ──
                 try:
                     face_results = face_det_model(crop_bgr, verbose=False)
                     face_boxes = face_results[0].boxes if len(face_results) > 0 else None
@@ -570,18 +533,16 @@ def main():
                     head_pose_writer.writerow([frame_id, tid, None, None, None])
 
             # ── Housekeeping ──
-            if frame_has_detections:
-                saved_frames += 1
-
+            processed_frames += 1
             del frame
             gc.collect()
 
-            if frame_id % 100 == 0 and frame_id > 0:
+            if processed_frames % 100 == 0 and processed_frames > 0:
                 body_csv_file.flush()
                 head_pose_csv_file.flush()
                 print(
-                    f"[INFO] Processed {frame_id}/{total_frames} frames "
-                    f"({saved_frames} with detections)..."
+                    f"[INFO] Processed {processed_frames} frames "
+                    f"(frame_id {frame_id}/{total_frames})..."
                 )
 
             frame_id += 1
@@ -591,11 +552,12 @@ def main():
 
     finally:
         cap.release()
+        cv2.destroyAllWindows()
 
         body_csv_file.close()
         head_pose_csv_file.close()
 
-        print(f"[INFO] Extraction done. {frame_id} total frames, {saved_frames} with detections.")
+        print(f"[INFO] Extraction done. {frame_id} total frames, {processed_frames} processed.")
         print(f"  → {BODY_OUTPUT}")
         print(f"  → {HEAD_POSE_OUTPUT}")
 
@@ -609,7 +571,7 @@ def main():
             merge_openface_outputs(OPENFACE_OUT_DIR, AU_OUTPUT, GAZE_OUTPUT)
 
         print("[INFO] All done!")
-        
+
         elapsed = time.time() - start_time
         hours, rem = divmod(elapsed, 3600)
         minutes, seconds = divmod(rem, 60)
