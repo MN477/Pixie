@@ -6,3 +6,6 @@ face_landmarker.task
 *.csv
 *.pt
 testing_vid/
+face_crops/
+openface_output/
+

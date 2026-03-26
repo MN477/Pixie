@@ -34,6 +34,7 @@ import shutil
 import subprocess
 import sys
 import threading
+import time
 import queue
 
 import cv2
@@ -50,6 +51,7 @@ INPUT_SOURCE = "testing_vid/HandRaise_019.mp4"
 BODY_OUTPUT      = "raw_body_multi.csv"
 HEAD_POSE_OUTPUT = "raw_head_pose_multi.csv"
 AU_OUTPUT        = "raw_action_units_multi.csv"
+GAZE_OUTPUT      = "raw_gaze_multi.csv"
 FACE_CROPS_DIR   = "face_crops"
 OPENFACE_OUT_DIR = "openface_output"
 
@@ -84,6 +86,13 @@ AU_BINARY_COLS = [
     "AU01_c", "AU02_c", "AU04_c", "AU05_c", "AU06_c", "AU07_c",
     "AU09_c", "AU10_c", "AU12_c", "AU14_c", "AU15_c", "AU17_c",
     "AU20_c", "AU23_c", "AU25_c", "AU26_c", "AU28_c", "AU45_c",
+]
+
+# Gaze columns output by OpenFace
+GAZE_COLS = [
+    "gaze_0_x", "gaze_0_y", "gaze_0_z",
+    "gaze_1_x", "gaze_1_y", "gaze_1_z",
+    "gaze_angle_x", "gaze_angle_y"
 ]
 
 FILENAME_PATTERN = re.compile(r"frame_(\d+)_track_(\d+)")
@@ -201,6 +210,7 @@ class OpenFaceWorker:
             "-fdir", os.path.abspath(batch_dir),
             "-out_dir", os.path.abspath(batch_out_dir),
             "-aus",
+            "-gaze",
             "-multi_view", "1",
         ]
 
@@ -237,9 +247,10 @@ class OpenFaceWorker:
 # ──────────────────────────────────────────────
 # OPENFACE CSV MERGING
 # ──────────────────────────────────────────────
-def merge_openface_outputs(openface_out_dir, output_csv):
-    """Parse all OpenFace batch output CSVs and merge into one clean CSV."""
-    all_rows = []
+def merge_openface_outputs(openface_out_dir, au_csv, gaze_csv):
+    """Parse all OpenFace batch output CSVs and merge into two clean CSVs."""
+    au_rows = []
+    gaze_rows = []
 
     # Walk through all batch subdirectories
     for root, dirs, files in os.walk(openface_out_dir):
@@ -261,34 +272,55 @@ def merge_openface_outputs(openface_out_dir, output_csv):
                 for row in reader:
                     cleaned = {k.strip(): v.strip() for k, v in row.items()}
                     confidence = float(cleaned.get("confidence", 0))
-                    success = int(cleaned.get("success", 0))
+                    
+                    # FaceLandmarkImg.exe single-image mode sometimes omits 'success'
+                    # Default to 1 (success) because YOLO already guaranteed a face crop.
+                    success_val = cleaned.get("success")
+                    success = int(success_val) if success_val is not None else 1
 
-                    out_row = {
+                    common_dict = {
                         "frame_id": frame_id,
                         "track_id": track_id,
                         "confidence": f"{confidence:.4f}",
                         "success": success,
                     }
 
+                    out_au = dict(common_dict)
+                    out_gaze = dict(common_dict)
+
                     if success:
                         for au_col in AU_INTENSITY_COLS + AU_BINARY_COLS:
-                            out_row[au_col] = cleaned.get(au_col, "")
+                            out_au[au_col] = cleaned.get(au_col, "")
+                        for gz_col in GAZE_COLS:
+                            out_gaze[gz_col] = cleaned.get(gz_col, "")
                     else:
                         for au_col in AU_INTENSITY_COLS + AU_BINARY_COLS:
-                            out_row[au_col] = ""
+                            out_au[au_col] = ""
+                        for gz_col in GAZE_COLS:
+                            out_gaze[gz_col] = ""
 
-                    all_rows.append(out_row)
+                    au_rows.append(out_au)
+                    gaze_rows.append(out_gaze)
 
-    all_rows.sort(key=lambda r: (r["frame_id"], r["track_id"]))
+    au_rows.sort(key=lambda r: (r["frame_id"], r["track_id"]))
+    gaze_rows.sort(key=lambda r: (r["frame_id"], r["track_id"]))
 
-    fieldnames = ["frame_id", "track_id", "confidence", "success"] + AU_INTENSITY_COLS + AU_BINARY_COLS
+    au_fieldnames = ["frame_id", "track_id", "confidence", "success"] + AU_INTENSITY_COLS + AU_BINARY_COLS
+    gaze_fieldnames = ["frame_id", "track_id", "confidence", "success"] + GAZE_COLS
 
-    with open(output_csv, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
+    with open(au_csv, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=au_fieldnames)
         writer.writeheader()
-        writer.writerows(all_rows)
+        writer.writerows(au_rows)
 
-    print(f"[OpenFace] Merged {len(all_rows)} rows → {output_csv}")
+    with open(gaze_csv, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=gaze_fieldnames)
+        writer.writeheader()
+        writer.writerows(gaze_rows)
+
+    print(f"[OpenFace] Merged {len(au_rows)} AU and Gaze rows")
+    print(f"  → {au_csv}")
+    print(f"  → {gaze_csv}")
 
 
 # ──────────────────────────────────────────────
@@ -314,8 +346,14 @@ gpu_id = 0 if torch.cuda.is_available() else -1
 sixd_model = SixDRepNet(gpu_id=gpu_id)
 
 # ──────────────────────────────────────────────
-# CREATE DIRECTORIES
+# PREPARE DIRECTORIES
 # ──────────────────────────────────────────────
+print("[INFO] Cleaning up previous run data...")
+if os.path.isdir(FACE_CROPS_DIR):
+    shutil.rmtree(FACE_CROPS_DIR, ignore_errors=True)
+if os.path.isdir(OPENFACE_OUT_DIR):
+    shutil.rmtree(OPENFACE_OUT_DIR, ignore_errors=True)
+
 os.makedirs(FACE_CROPS_DIR, exist_ok=True)
 os.makedirs(OPENFACE_OUT_DIR, exist_ok=True)
 
@@ -339,6 +377,8 @@ head_pose_writer.writerow([
 # MAIN LOOP
 # ──────────────────────────────────────────────
 def main():
+    start_time = time.time()
+
     # Verify OpenFace is available
     if not os.path.isfile(OPENFACE_EXE):
         print(f"[WARN] OpenFace not found at {OPENFACE_EXE} — AU extraction will be skipped")
@@ -564,21 +604,16 @@ def main():
             print("[INFO] Waiting for OpenFace background worker to finish...")
             of_worker.flush_and_stop()
 
-            # ── Merge all OpenFace outputs into final CSV ──
+            # ── Merge all OpenFace outputs into final CSVs ──
             print("[INFO] Merging OpenFace outputs...")
-            merge_openface_outputs(OPENFACE_OUT_DIR, AU_OUTPUT)
-            print(f"  → {AU_OUTPUT}")
+            merge_openface_outputs(OPENFACE_OUT_DIR, AU_OUTPUT, GAZE_OUTPUT)
 
         print("[INFO] All done!")
-
-        # ── Cleanup: delete face crops and OpenFace temp output ──
-        print("[INFO] Cleaning up temporary files...")
-        if os.path.isdir(FACE_CROPS_DIR):
-            shutil.rmtree(FACE_CROPS_DIR, ignore_errors=True)
-            print(f"  ✓ Deleted {FACE_CROPS_DIR}/")
-        if os.path.isdir(OPENFACE_OUT_DIR):
-            shutil.rmtree(OPENFACE_OUT_DIR, ignore_errors=True)
-            print(f"  ✓ Deleted {OPENFACE_OUT_DIR}/")
+        
+        elapsed = time.time() - start_time
+        hours, rem = divmod(elapsed, 3600)
+        minutes, seconds = divmod(rem, 60)
+        print(f"[INFO] Total execution time: {int(hours):02d}:{int(minutes):02d}:{seconds:05.2f}")
 
 
 if __name__ == "__main__":

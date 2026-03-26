@@ -20,6 +20,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 
 # ──────────────────────────────────────────────
 # CONFIGURATION
@@ -29,7 +30,8 @@ OPENFACE_EXE = os.path.join(OPENFACE_DIR, "FaceLandmarkImg.exe")
 
 FACE_CROPS_DIR = "face_crops"
 OPENFACE_OUTPUT_DIR = "openface_output"
-FINAL_OUTPUT = "raw_action_units_multi.csv"
+AU_OUTPUT = "raw_action_units_multi.csv"
+GAZE_OUTPUT = "raw_gaze_multi.csv"
 
 # Regex to extract frame_id and track_id from filenames like frame_000123_track_1.jpg
 FILENAME_PATTERN = re.compile(r"frame_(\d+)_track_(\d+)")
@@ -44,6 +46,13 @@ AU_BINARY_COLS = [
     "AU01_c", "AU02_c", "AU04_c", "AU05_c", "AU06_c", "AU07_c",
     "AU09_c", "AU10_c", "AU12_c", "AU14_c", "AU15_c", "AU17_c",
     "AU20_c", "AU23_c", "AU25_c", "AU26_c", "AU28_c", "AU45_c",
+]
+
+# Gaze columns output by OpenFace
+GAZE_COLS = [
+    "gaze_0_x", "gaze_0_y", "gaze_0_z",
+    "gaze_1_x", "gaze_1_y", "gaze_1_z",
+    "gaze_angle_x", "gaze_angle_y"
 ]
 
 
@@ -65,6 +74,9 @@ def run_openface():
 
     print(f"[INFO] Found {len(crop_files)} face crops to process")
 
+    # Clear previous output
+    if os.path.isdir(OPENFACE_OUTPUT_DIR):
+        shutil.rmtree(OPENFACE_OUTPUT_DIR, ignore_errors=True)
     os.makedirs(OPENFACE_OUTPUT_DIR, exist_ok=True)
 
     # Run OpenFace on the directory of face crops
@@ -73,6 +85,7 @@ def run_openface():
         "-fdir", os.path.abspath(FACE_CROPS_DIR),
         "-out_dir", os.path.abspath(OPENFACE_OUTPUT_DIR),
         "-aus",       # output Action Units
+        "-gaze",      # output Gaze
         "-multi_view", "1",  # single face per image
     ]
 
@@ -103,7 +116,8 @@ def parse_and_merge():
     print(f"[INFO] Found {len(of_csvs)} OpenFace output CSVs")
 
     # Collect all rows
-    all_rows = []
+    au_rows = []
+    gaze_rows = []
 
     for csv_file in of_csvs:
         csv_path = os.path.join(OPENFACE_OUTPUT_DIR, csv_file)
@@ -127,40 +141,58 @@ def parse_and_merge():
 
                 # Check if face was detected successfully
                 confidence = float(cleaned.get("confidence", 0))
-                success = int(cleaned.get("success", 0))
+                
+                # FaceLandmarkImg.exe single-image mode sometimes omits 'success'
+                # Default to 1 (success) because YOLO already guaranteed a face crop.
+                success_val = cleaned.get("success")
+                success = int(success_val) if success_val is not None else 1
 
-                out_row = {
+                common_dict = {
                     "frame_id": frame_id,
                     "track_id": track_id,
                     "confidence": f"{confidence:.4f}",
                     "success": success,
                 }
 
+                out_au = dict(common_dict)
+                out_gaze = dict(common_dict)
+
                 if success:
                     for au_col in AU_INTENSITY_COLS + AU_BINARY_COLS:
-                        out_row[au_col] = cleaned.get(au_col, "")
+                        out_au[au_col] = cleaned.get(au_col, "")
+                    for gz_col in GAZE_COLS:
+                        out_gaze[gz_col] = cleaned.get(gz_col, "")
                 else:
-                    # Failed — fill AUs with None
                     for au_col in AU_INTENSITY_COLS + AU_BINARY_COLS:
-                        out_row[au_col] = ""
+                        out_au[au_col] = ""
+                    for gz_col in GAZE_COLS:
+                        out_gaze[gz_col] = ""
 
-                all_rows.append(out_row)
+                au_rows.append(out_au)
+                gaze_rows.append(out_gaze)
 
     # Sort by frame_id, then track_id
-    all_rows.sort(key=lambda r: (r["frame_id"], r["track_id"]))
+    au_rows.sort(key=lambda r: (r["frame_id"], r["track_id"]))
+    gaze_rows.sort(key=lambda r: (r["frame_id"], r["track_id"]))
 
-    # Write final CSV
-    fieldnames = ["frame_id", "track_id", "confidence", "success"] + AU_INTENSITY_COLS + AU_BINARY_COLS
+    au_fieldnames = ["frame_id", "track_id", "confidence", "success"] + AU_INTENSITY_COLS + AU_BINARY_COLS
+    gaze_fieldnames = ["frame_id", "track_id", "confidence", "success"] + GAZE_COLS
 
-    with open(FINAL_OUTPUT, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
+    with open(AU_OUTPUT, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=au_fieldnames)
         writer.writeheader()
-        writer.writerows(all_rows)
+        writer.writerows(au_rows)
 
-    print(f"[INFO] Written {len(all_rows)} rows to {FINAL_OUTPUT}")
+    with open(GAZE_OUTPUT, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=gaze_fieldnames)
+        writer.writeheader()
+        writer.writerows(gaze_rows)
+
+    print(f"[INFO] Written {len(au_rows)} rows to {AU_OUTPUT} and {GAZE_OUTPUT}")
 
 
 def main():
+    start_time = time.time()
     print("=" * 60)
     print("OpenFace Batch Processing — Action Unit Extraction")
     print("=" * 60)
@@ -172,21 +204,16 @@ def main():
         # Step 2: Parse and merge into final CSV
         parse_and_merge()
 
-        print(f"\n[DONE] Final output: {FINAL_OUTPUT}")
-        print("  Columns: frame_id, track_id, confidence, success, AU01_r..AU45_r, AU01_c..AU45_c")
+        print("\n[DONE] Final outputs: {AU_OUTPUT}, {GAZE_OUTPUT}")
         print("  Join with raw_body_multi.csv / raw_head_pose_multi.csv by (frame_id, track_id)")
+
+        elapsed = time.time() - start_time
+        hours, rem = divmod(elapsed, 3600)
+        minutes, seconds = divmod(rem, 60)
+        print(f"\n[INFO] Total execution time: {int(hours):02d}:{int(minutes):02d}:{seconds:05.2f}")
 
     except KeyboardInterrupt:
         print("\n[INFO] Interrupted by user (Ctrl+C).")
-
-    finally:
-        print("[INFO] Cleaning up temporary files...")
-        if os.path.isdir(FACE_CROPS_DIR):
-            shutil.rmtree(FACE_CROPS_DIR, ignore_errors=True)
-            print(f"  ✓ Deleted {FACE_CROPS_DIR}/")
-        if os.path.isdir(OPENFACE_OUTPUT_DIR):
-            shutil.rmtree(OPENFACE_OUTPUT_DIR, ignore_errors=True)
-            print(f"  ✓ Deleted {OPENFACE_OUTPUT_DIR}/")
 
 
 if __name__ == "__main__":
