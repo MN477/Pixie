@@ -47,7 +47,7 @@ from sixdrepnet import SixDRepNet
 # ──────────────────────────────────────────────
 # CONFIGURATION
 # ──────────────────────────────────────────────
-INPUT_SOURCE = "testing_vid/2stud.mp4"
+INPUT_SOURCE = "testing_vid/own_vid(headTesting)2.mp4"
 
 BODY_OUTPUT      = "raw_body_multi.csv"
 HEAD_POSE_OUTPUT = "raw_head_pose_multi.csv"
@@ -68,7 +68,7 @@ OPENFACE_EXE = os.path.join(OPENFACE_DIR, "FaceLandmarkImg.exe")
 FRAME_STRIDE        = 1     # process every Nth frame (1 = all, 2 = half, etc.)
 INFERENCE_SIZE      = 480   # YOLO inference resolution (lower = faster)
 EXPAND_RATIO        = 0.20  # body bbox expansion for face detection crop
-OPENFACE_BATCH_SIZE = 300   # OpenFace batch trigger size
+OPENFACE_BATCH_SIZE = 300  # OpenFace batch trigger size
 
 # COCO 17 keypoint names
 COCO_KEYPOINTS = [
