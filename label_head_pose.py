@@ -15,6 +15,7 @@ Outputs:
 import pandas as pd
 import numpy as np
 import os
+import time
 
 # ──────────────────────────────────────────────
 # CONFIGURATION
@@ -23,21 +24,21 @@ INPUT_CSV = "raw_head_pose_multi.csv"
 OUTPUT_CSV = "labeled_head_pose_multi.csv"
 
 # Smoothing & Interpolation
-MEDIAN_WINDOW = 5       # Frames to smooth over (e.g., 5 frames = ~0.3s at 15fps)
-INTERPOLATE_LIMIT = 3   # Max consecutive missing frames to "guess" (interpolate)
+MEDIAN_WINDOW = 5       # Frames to smooth over (e.g., 5 frames = ~0.3s at 15fps) !!!!!!hard coded 
+INTERPOLATE_LIMIT = 3   # Max consecutive missing frames to "guess" (interpolate) !!!!!!hard coded
 
 # Hard Thresholds (Degrees)
-PITCH_DOWN_THRESH =  15.0  # Pitch > this = Looking Down
-PITCH_UP_THRESH   = -15.0  # Pitch < this = Looking Up
+PITCH_DOWN_THRESH =  15.0  # Pitch > this = Looking Down   !!!!!!hard coded
+PITCH_UP_THRESH   = -15.0  # Pitch < this = Looking Up     !!!!!!hard coded
 
-YAW_LEFT_THRESH   =  20.0  # Yaw > this = Turned Left
-YAW_RIGHT_THRESH  = -20.0  # Yaw < this = Turned Right
+YAW_LEFT_THRESH   =  20.0  # Yaw > this = Turned Left      !!!!!!hard coded
+YAW_RIGHT_THRESH  = -20.0  # Yaw < this = Turned Right      !!!!!!hard coded
 
-ROLL_LEFT_THRESH  =  15.0  # Roll > this = Tilt-Left
-ROLL_RIGHT_THRESH = -15.0  # Roll < this = Tilt-Right
+ROLL_LEFT_THRESH  =  15.0  # Roll > this = Tilt-Left   !!!!!!hard coded
+ROLL_RIGHT_THRESH = -15.0  # Roll < this = Tilt-Rightb   !!!!!!hard coded
 
 # Margin (Degrees) past threshold required to reach maximum confidence (1.0)
-MARGIN = 10.0
+MARGIN = 10.0           # !!!!!!hard coded
 
 
 # ──────────────────────────────────────────────
@@ -112,13 +113,15 @@ def classify_pose(row):
         else:
             t_conf = 1.0 - 0.5 * (roll / ROLL_RIGHT_THRESH)
 
-    # 4. Overall Confidence (Average of the three axes)
-    avg_conf = (p_conf + y_conf + t_conf) / 3.0
+    # 4. Overall Confidence (Average of the three axes, weighted)
+    avg_conf= (y_conf * 0.4) + (p_conf * 0.4) + (t_conf * 0.2)
 
     return pd.Series([pose_label, t_label, avg_conf])
 
 
 def main():
+    start_time = time.time()
+
     if not os.path.exists(INPUT_CSV):
         print(f"[ERROR] Input CSV not found: {INPUT_CSV}")
         return
@@ -173,7 +176,7 @@ def main():
     final_df = final_df.sort_values(by=["frame_id", "track_id"]).reset_index(drop=True)
     
     # 3. Apply Classification and Confidence Scoring
-    print("Applying discrete classification thresholds and fuzzy logic...")
+    print("Applying discrete classification thresholds ...")
     final_df[["pose_label", "tilt_label", "confidence"]] = final_df.apply(classify_pose, axis=1)
     
     # Format floating point numbers
@@ -201,6 +204,10 @@ def main():
     print("\nTilt Label Distribution:")
     print(output_df["tilt_label"].value_counts().to_string())
     print("-" * 40)
+    
+    end_time = time.time()
+    execution_time = end_time - start_time
+    print(f" Total execution time: {execution_time:.2f} seconds\n")
 
 if __name__ == "__main__":
     main()
