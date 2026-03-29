@@ -28,14 +28,18 @@ MEDIAN_WINDOW = 5       # Frames to smooth over (e.g., 5 frames = ~0.3s at 15fps
 INTERPOLATE_LIMIT = 3   # Max consecutive missing frames to "guess" (interpolate) !!!!!!hard coded
 
 # Hard Thresholds (Degrees)
-PITCH_DOWN_THRESH =  15.0  # Pitch > this = Looking Down   !!!!!!hard coded
-PITCH_UP_THRESH   = -15.0  # Pitch < this = Looking Up     !!!!!!hard coded
+PITCH_UP_THRESH =  15.0  # Pitch > this = Looking Up   !!!!!!hard coded
+PITCH_DOWN_THRESH   = -15.0  # Pitch < this = Looking Down     !!!!!!hard coded
 
 YAW_LEFT_THRESH   =  20.0  # Yaw > this = Turned Left      !!!!!!hard coded
 YAW_RIGHT_THRESH  = -20.0  # Yaw < this = Turned Right      !!!!!!hard coded
 
 ROLL_LEFT_THRESH  =  15.0  # Roll > this = Tilt-Left   !!!!!!hard coded
 ROLL_RIGHT_THRESH = -15.0  # Roll < this = Tilt-Rightb   !!!!!!hard coded
+
+# OpenFace Reliability Limits
+YAW_RELIABLE_LIMIT   = 35.0
+PITCH_RELIABLE_LIMIT = 20.0
 
 # Margin (Degrees) past threshold required to reach maximum confidence (1.0)
 MARGIN = 10.0           # !!!!!!hard coded
@@ -179,6 +183,12 @@ def main():
     print("Applying discrete classification thresholds ...")
     final_df[["pose_label", "tilt_label", "confidence"]] = final_df.apply(classify_pose, axis=1)
     
+    # Calculate OpenFace reliable flag
+    final_df["openface_reliable"] = (
+        (final_df["yaw_smooth"].abs() < YAW_RELIABLE_LIMIT) & 
+        (final_df["pitch_smooth"].abs() < PITCH_RELIABLE_LIMIT)
+    )
+
     # Format floating point numbers
     for col in ["pitch_smooth", "yaw_smooth", "roll_smooth"]:
         final_df[col] = final_df[col].round(4)
@@ -189,7 +199,7 @@ def main():
         "frame_id", "track_id", 
         "pitch_smooth", "yaw_smooth", "roll_smooth", 
         "pose_label", "tilt_label", "confidence", 
-        "is_interpolated", "is_missing"
+        "is_interpolated", "is_missing", "openface_reliable"
     ]
     output_df = final_df[out_cols]
     

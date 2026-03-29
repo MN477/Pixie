@@ -47,7 +47,7 @@ from sixdrepnet import SixDRepNet
 # ──────────────────────────────────────────────
 # CONFIGURATION
 # ──────────────────────────────────────────────
-INPUT_SOURCE = "testing_vid/own_vid(headTesting)2.mp4"
+INPUT_SOURCE = "testing_vid/facial_activity 1.mp4"
 
 BODY_OUTPUT      = "raw_body_multi.csv"
 HEAD_POSE_OUTPUT = "raw_head_pose_multi.csv"
@@ -388,8 +388,10 @@ def main():
         while True:
             ret, frame = cap.read()
             if not ret:
-                print("[INFO] End of video stream.")
+                print("\n[INFO] End of video stream.")
                 break
+
+            print(f"Processing video frame {frame_id}/{total_frames}...", end='\r', flush=True)
 
             # ── Frame stride: skip frames ──
             if frame_id % FRAME_STRIDE != 0:
@@ -432,6 +434,11 @@ def main():
 
             # Debug visualisation
             debug_frame = frame.copy()
+            cv2.putText(
+                debug_frame, f"Frame: {frame_id}/{total_frames}",
+                (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 
+                1.0, (0, 0, 255), 2
+            )
             for bbox, track_id in zip(xyxy_list, track_ids):
                 x1, y1, x2, y2 = bbox
                 cv2.rectangle(debug_frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
@@ -541,7 +548,7 @@ def main():
                 body_csv_file.flush()
                 head_pose_csv_file.flush()
                 print(
-                    f"[INFO] Processed {processed_frames} frames "
+                    f"\n[INFO] Processed {processed_frames} frames "
                     f"(frame_id {frame_id}/{total_frames})..."
                 )
 
