@@ -47,7 +47,7 @@ from sixdrepnet import SixDRepNet
 # ──────────────────────────────────────────────
 # CONFIGURATION
 # ──────────────────────────────────────────────
-INPUT_SOURCE = "testing_vid/facial_activity 1.mp4"
+INPUT_SOURCE = "/Users/sarahselmene/Desktop/Pixie/sarra.mov"
 
 BODY_OUTPUT      = "raw_body_multi.csv"
 HEAD_POSE_OUTPUT = "raw_head_pose_multi.csv"
@@ -58,7 +58,7 @@ OPENFACE_OUT_DIR = "openface_output"
 
 # Models (YOLO11m removed — YOLOv8-pose handles detection + tracking + pose)
 POSE_MODEL_PATH      = "yolov8n-pose.pt"
-FACE_YOLO_MODEL_PATH = "yolov11m-face.pt"
+FACE_YOLO_MODEL_PATH = "yolov8n.pt"
 
 # OpenFace
 OPENFACE_DIR = r"C:\Users\mouss\Documents\OpenFace_2.2.0_win_x86"
@@ -68,7 +68,7 @@ OPENFACE_EXE = os.path.join(OPENFACE_DIR, "FaceLandmarkImg.exe")
 FRAME_STRIDE        = 1     # process every Nth frame (1 = all, 2 = half, etc.)
 INFERENCE_SIZE      = 480   # YOLO inference resolution (lower = faster)
 EXPAND_RATIO        = 0.20  # body bbox expansion for face detection crop
-OPENFACE_BATCH_SIZE = 300  # OpenFace batch trigger size
+OPENFACE_BATCH_SIZE = 300   # OpenFace batch trigger size
 
 # COCO 17 keypoint names
 COCO_KEYPOINTS = [
@@ -316,7 +316,7 @@ face_det_model.to(device)
 
 print("[INFO] Initializing 6DRepNet...")
 gpu_id = 0 if torch.cuda.is_available() else -1
-sixd_model = SixDRepNet(gpu_id=gpu_id)
+sixd_model = SixDRepNet(gpu_id=-1)
 
 # ──────────────────────────────────────────────
 # PREPARE DIRECTORIES
@@ -388,10 +388,8 @@ def main():
         while True:
             ret, frame = cap.read()
             if not ret:
-                print("\n[INFO] End of video stream.")
+                print("[INFO] End of video stream.")
                 break
-
-            print(f"Processing video frame {frame_id}/{total_frames}...", end='\r', flush=True)
 
             # ── Frame stride: skip frames ──
             if frame_id % FRAME_STRIDE != 0:
@@ -434,11 +432,6 @@ def main():
 
             # Debug visualisation
             debug_frame = frame.copy()
-            cv2.putText(
-                debug_frame, f"Frame: {frame_id}/{total_frames}",
-                (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 
-                1.0, (0, 0, 255), 2
-            )
             for bbox, track_id in zip(xyxy_list, track_ids):
                 x1, y1, x2, y2 = bbox
                 cv2.rectangle(debug_frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
@@ -548,7 +541,7 @@ def main():
                 body_csv_file.flush()
                 head_pose_csv_file.flush()
                 print(
-                    f"\n[INFO] Processed {processed_frames} frames "
+                    f"[INFO] Processed {processed_frames} frames "
                     f"(frame_id {frame_id}/{total_frames})..."
                 )
 
@@ -587,3 +580,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+#code pour tester le script 
+# if __name__ == "__main__":
