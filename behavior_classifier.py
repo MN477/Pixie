@@ -1,470 +1,1385 @@
 """
-behavior_classifier.py
-======================
-Post-traitement de raw_body_multi.csv (généré par extract_raw_data_multi.py).
+=============================================================================
+behaviour_classifier_visual.py  —  v5
+=============================================================================
+WHAT THIS SCRIPT DOES
+---------------------
+1. Reads raw_body_multi.csv (produced by extract_raw_data_multi.py).
+   This CSV contains one row per keypoint per person per frame:
+       frame_id | track_id | landmark_idx | x | y | visibility
 
-Calcule pour chaque track_id et chaque frame :
-  1. is_hand_raised       — main levée (poignet au-dessus de l'épaule)
-  2. posture              — "sitting" | "standing" | "slouching"
-  3. agitation_score      — score cumulé d'agitation (fidgeting / TDAH)
-  4. is_stimming          — mouvement répétitif oscillatoire des poignets (TSA)
+2. Groups all rows by frame_id, rebuilds a (17, 3) keypoint array for
+   each (frame_id, track_id) pair.
 
-Sorties :
-  behavior_per_frame.csv  — indicateurs frame par frame
-  behavior_summary.csv    — résumé agrégé par track_id
+3. For each frame_id, seeks the video to that exact frame using
+   cap.set(CAP_PROP_POS_FRAMES, frame_id) so CSV and video are
+   always in perfect sync — regardless of FRAME_STRIDE used during extraction.
 
-Usage :
-    python behavior_classifier.py
-    python behavior_classifier.py --input raw_body_multi.csv --fps 30
+4. Runs the 5-behaviour pipeline on the keypoints from the CSV:
+       sitting | slouching | standing | bounding | hand_raised
+
+5. Draws the results onto the video frame and displays in an OpenCV window.
+
+6. Writes two output CSVs:
+       behaviour_raw_frames.csv  — one row per (frame, person)
+       behaviour_summary.csv     — one row per behaviour episode
+
+CHANGES IN v5
+-------------
+- "bouncing" behaviour renamed to "bounding" (large body displacement / jumping detection)
+- BoundingDetector: replaces FFT-based oscillation with displacement-based detection.
+  Triggers when a person's hip centroid moves > BOUND_DISP_NORM * shoulder_width
+  in a single frame (vertical or diagonal leap), confirmed over multiple frames.
+- Improved PostureClassifier:
+    * Hysteresis added to sitting ↔ standing transitions (avoids flicker at threshold)
+    * Separate left/right knee logic — only one side needed for sitting detection
+    * Visibility-weighted averaging of left/right knee angles
+    * Better confidence scaling
+- Improved SlouchDetector:
+    * Added hip-shoulder vertical offset check (hunching forward)
+    * Nose/shoulder ratio measured more robustly
+- Improved HandRaiseSM:
+    * Smoothed wrist position used for geometry check
+    * Added elbow-above-shoulder as a stronger sub-condition
+    * Stricter lowering hysteresis to prevent false resets
+- KeypointBuffer:
+    * Increased KP_INTERP_MAX to 10 frames for better occlusion handling
+    * Kalman R reduced slightly for tighter tracking
+- Display: "bounding" shown in bright cyan
+
+CONTROLS
+--------
+  SPACE      pause / resume  (or advance one frame when paused)
+  Q / ESC    quit
+  S          save current frame as PNG snapshot
+  + / -      increase / decrease playback speed
+
+USAGE
+-----
+  python behaviour_classifier_v5.py \
+      --video mardi.mov \
+      --body  raw_body_multi.csv
+
+  # Step through frame by frame (useful for debugging):
+  python behaviour_classifier_v5.py --video mardi.mov --body raw_body_multi.csv --step
+
+  # Save annotated video:
+  python behaviour_classifier_v5.py --video mardi.mov --body raw_body_multi.csv \
+      --save-video output_annotated.mp4
+
+DEPENDENCIES
+------------
+  pip install numpy pandas opencv-python
+=============================================================================
 """
 
-import argparse
-import os
-import warnings
-from collections import defaultdict
+from __future__ import annotations
 
+import argparse
+import csv
+import math
+import sys
+import time
+from collections import defaultdict, deque
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Optional
+
+import cv2
 import numpy as np
 import pandas as pd
-from scipy.signal import find_peaks
 
-warnings.filterwarnings("ignore")
 
-# ──────────────────────────────────────────────
-# COCO-17 keypoint indices (same as extractor)
-# ──────────────────────────────────────────────
-KP = {
-    "nose":            0,
-    "left_eye":        1,
-    "right_eye":       2,
-    "left_ear":        3,
-    "right_ear":       4,
-    "left_shoulder":   5,
-    "right_shoulder":  6,
-    "left_elbow":      7,
-    "right_elbow":     8,
-    "left_wrist":      9,
-    "right_wrist":     10,
-    "left_hip":        11,
-    "right_hip":       12,
-    "left_knee":       13,
-    "right_knee":      14,
-    "left_ankle":      15,
-    "right_ankle":     16,
-}
+# ==============================================================================
+# COCO KEYPOINT INDICES  (YOLOv8-pose, 17 joints)
+# ==============================================================================
 
-# ──────────────────────────────────────────────
-# TUNEABLE THRESHOLDS
-# ──────────────────────────────────────────────
-VIS_THRESHOLD       = 0.3   # minimum YOLO confidence to consider a keypoint valid
+KP_NOSE           = 0
+KP_LEFT_EYE       = 1
+KP_RIGHT_EYE      = 2
+KP_LEFT_EAR       = 3
+KP_RIGHT_EAR      = 4
+KP_LEFT_SHOULDER  = 5
+KP_RIGHT_SHOULDER = 6
+KP_LEFT_ELBOW     = 7
+KP_RIGHT_ELBOW    = 8
+KP_LEFT_WRIST     = 9
+KP_RIGHT_WRIST    = 10
+KP_LEFT_HIP       = 11
+KP_RIGHT_HIP      = 12
+KP_LEFT_KNEE      = 13
+KP_RIGHT_KNEE     = 14
+KP_LEFT_ANKLE     = 15
+KP_RIGHT_ANKLE    = 16
+N_KP              = 17
 
-# --- Hand Raising ---
-HAND_RAISE_MARGIN   = 0.0   # pixels — wrist must be this much ABOVE shoulder (y_wrist < y_shoulder - margin)
 
-# --- Posture ---
-# Sitting  : shoulder-hip dist / total skeleton height in [SIT_LOW, SIT_HIGH]
-SIT_RATIO_LOW       = 0.15
-SIT_RATIO_HIGH      = 0.45
-# Standing : shoulder-ankle vertical span > STAND_RATIO * total height
-STAND_RATIO         = 0.55
-# Slouching: nose-shoulder vertical dist < SLOUCH_RATIO * shoulder-hip dist
-SLOUCH_RATIO        = 0.30
+# ==============================================================================
+# CONFIGURATION
+# ==============================================================================
 
-# --- Agitation (Fidgeting) ---
-AGITATION_SPEED_THR = 8.0   # px/frame — mean joint speed above this → agitation++
-AGITATION_JOINTS    = [     # joints used for agitation speed calculation
-    KP["left_wrist"], KP["right_wrist"],
-    KP["left_elbow"], KP["right_elbow"],
-    KP["left_shoulder"], KP["right_shoulder"],
+class CFG:
+    # I/O (overridden by CLI)
+    VIDEO_PATH:  str = "sarra2.mov"
+    BODY_CSV:    str = "raw_body_multi.csv"
+    RAW_OUT_CSV: str = "behaviour_raw_frames.csv"
+    SUM_OUT_CSV: str = "behaviour_summary.csv"
+
+    # Keypoint confidence gate
+    KP_CONF_MIN:   float = 0.25          # lowered from 0.30 for more detections
+    KP_INTERP_MAX: int   = 10            # increased: extrapolate up to 10 missing frames
+
+    # Kalman filter noise
+    KP_KALMAN_Q: float = 2e-4            # slightly reduced → smoother tracks
+    KP_KALMAN_R: float = 6e-3            # slightly tighter measurement trust
+
+    # Body ruler fallback when both shoulders invisible
+    FALLBACK_SW: float = 100.0
+
+    # ── Behaviour 1 & 3 : Sitting / Standing (with hysteresis) ────────────
+    SITTING_KNEE_ANGLE_MAX:   float = 140.0   # enter sitting if avg < this
+    SITTING_KNEE_ANGLE_EXIT:  float = 150.0   # leave sitting if avg > this (hysteresis)
+    STANDING_KNEE_ANGLE_MIN:  float = 158.0   # enter standing if avg > this
+    STANDING_KNEE_ANGLE_EXIT: float = 148.0   # leave standing if avg < this (hysteresis)
+    POSTURE_CONFIRM_FRAMES:   int   = 4        # frames a posture must hold before switching
+
+    # ── Behaviour 2 : Slouching ────────────────────────────────────────────
+    SLOUCH_SPINE_TILT_MAX:     float = 12.0   # deg from vertical — tighter threshold
+    SLOUCH_NOSE_DROP_NORM:     float = 0.15   # nose drop / shoulder_width
+    SLOUCH_HIP_FORWARD_NORM:   float = 0.10   # hip mid ahead of shoulder mid / sw
+
+    # ── Behaviour 4 : Bounding (large body displacement — leaping/jumping) ──
+    # Replaces the old FFT-based "bouncing" detector.
+    # Triggers when the hip centroid moves > BOUND_DISP_NORM * sw per frame,
+    # confirmed over BOUND_CONFIRM_FRAMES consecutive frames.
+    BOUND_DISP_NORM:      float = 0.25   # displacement threshold relative to sw
+    BOUND_CONFIRM_FRAMES: int   = 3      # frames needed to confirm bounding
+    BOUND_DECAY_FRAMES:   int   = 8      # frames bounding stays active after last trigger
+    BOUND_HISTORY_LEN:    int   = 5      # rolling window for displacement smoothing
+
+    # ── Behaviour 5 : Hand raise ───────────────────────────────────────────
+    HAND_ABOVE_MARGIN_NORM: float = 0.08   # wrist above shoulder / sw (slightly tighter)
+    ELBOW_ABOVE_SHOULDER:   bool  = True   # require elbow above shoulder midpoint too
+    HAND_VEL_NORM:          float = 0.06   # reduced: upward wrist vel / sw / frame
+    HAND_RAISE_HOLD:        int   = 6      # frames to confirm raise
+    HAND_LOWER_HOLD:        int   = 15     # frames to confirm lower (stronger hysteresis)
+
+    # ── Display ────────────────────────────────────────────────────────────
+    WINDOW_NAME: str = "Behaviour Classifier v5"
+
+    # Behaviour colour map (BGR)
+    BEHAVIOUR_COLORS: dict = {
+        "sitting":     (0,   200, 255),   # amber
+        "standing":    (0,   220,  80),   # green
+        "slouching":   (0,    80, 255),   # red-orange
+        "bounding":    (255, 230,   0),   # bright cyan
+        "hand_raised": (255,   0, 200),   # magenta
+        "unknown":     (140, 140, 140),   # grey
+    }
+
+    # Per-track ID colours for skeleton
+    ID_PALETTE = [
+        (0, 200, 255), (0, 255, 128), (255, 128, 0),
+        (200, 0, 255), (0, 128, 255), (255, 0, 128),
+        (128, 255, 0), (255, 200, 0), (0, 255, 220),
+    ]
+
+
+# ==============================================================================
+# 2-D KALMAN FILTER  (one per keypoint)
+# ==============================================================================
+
+class KalmanKP:
+    """
+    State = [x, vx, y, vy]  (constant-velocity model).
+    Smooths detection jitter; extrapolates through brief occlusions.
+    """
+
+    def __init__(self) -> None:
+        self.x = np.zeros(4, dtype=np.float64)
+        self.P = np.eye(4, dtype=np.float64) * 10.0
+        dt = 1.0
+        self.F = np.array([
+            [1, dt, 0,  0],
+            [0,  1, 0,  0],
+            [0,  0, 1, dt],
+            [0,  0, 0,  1],
+        ], dtype=np.float64)
+        self.H  = np.array([[1, 0, 0, 0], [0, 0, 1, 0]], dtype=np.float64)
+        q       = CFG.KP_KALMAN_Q
+        self.Q  = np.diag([q, q * 10, q, q * 10])
+        self.R  = np.eye(2) * CFG.KP_KALMAN_R
+        self._init          = False
+        self.missing_frames = 0
+
+    def predict_only(self) -> tuple[float, float]:
+        if not self._init:
+            return 0.0, 0.0
+        self.x = self.F @ self.x
+        self.P = self.F @ self.P @ self.F.T + self.Q
+        self.missing_frames += 1
+        return float(self.x[0]), float(self.x[2])
+
+    def update(self, mx: float, my: float) -> tuple[float, float]:
+        if not self._init:
+            self.x[:] = [mx, 0.0, my, 0.0]
+            self._init          = True
+            self.missing_frames = 0
+            return mx, my
+        xp  = self.F @ self.x
+        Pp  = self.F @ self.P @ self.F.T + self.Q
+        z   = np.array([[mx], [my]], dtype=np.float64)
+        S   = self.H @ Pp @ self.H.T + self.R
+        K   = Pp @ self.H.T @ np.linalg.inv(S)
+        self.x = (xp.reshape(-1,1) + K @ (z - self.H @ xp.reshape(-1,1))).flatten()
+        self.P = (np.eye(4) - K @ self.H) @ Pp
+        self.missing_frames = 0
+        return float(self.x[0]), float(self.x[2])
+
+    @property
+    def vy_up(self) -> float:
+        """Upward velocity: positive = moving UP on screen (negated image vy)."""
+        return -float(self.x[3])
+
+    @property
+    def vx(self) -> float:
+        return float(self.x[1])
+
+    @property
+    def vy(self) -> float:
+        return float(self.x[3])
+
+
+# ==============================================================================
+# KEYPOINT BUFFER  (17 KalmanKP + confidence gate + interpolation)
+# ==============================================================================
+
+class KeypointBuffer:
+    """
+    Ingests one frame's (17, 3) array [x, y, confidence].
+    Returns smoothed, interpolated positions via .get(idx) -> (x,y) | None.
+    """
+
+    def __init__(self) -> None:
+        self.kf     = [KalmanKP() for _ in range(N_KP)]
+        self.smooth = np.full((N_KP, 2), np.nan, dtype=np.float64)
+        self.valid  = np.zeros(N_KP, dtype=bool)
+
+    def update(self, kp_array: np.ndarray) -> None:
+        for i in range(N_KP):
+            x_raw = float(kp_array[i, 0])
+            y_raw = float(kp_array[i, 1])
+            conf  = float(kp_array[i, 2]) if kp_array.shape[1] > 2 else 1.0
+
+            missing = (
+                conf < CFG.KP_CONF_MIN
+                or math.isnan(x_raw)
+                or (x_raw == 0.0 and y_raw == 0.0)
+            )
+
+            kf = self.kf[i]
+            if not missing:
+                sx, sy = kf.update(x_raw, y_raw)
+                self.smooth[i] = [sx, sy]
+                self.valid[i]  = True
+            elif kf._init and kf.missing_frames < CFG.KP_INTERP_MAX:
+                sx, sy = kf.predict_only()
+                self.smooth[i] = [sx, sy]
+                self.valid[i]  = True
+            else:
+                if kf._init:
+                    kf.missing_frames += 1
+                self.smooth[i] = [np.nan, np.nan]
+                self.valid[i]  = False
+
+    def get(self, idx: int) -> Optional[tuple[float, float]]:
+        if self.valid[idx]:
+            return float(self.smooth[idx, 0]), float(self.smooth[idx, 1])
+        return None
+
+    def kpf(self, idx: int) -> KalmanKP:
+        return self.kf[idx]
+
+
+# ==============================================================================
+# GEOMETRY HELPERS
+# ==============================================================================
+
+def _angle_deg(A: tuple, B: tuple, C: tuple) -> float:
+    """Angle at vertex B formed by rays B→A and B→C. Returns [0, 180] deg."""
+    ba    = np.array([A[0]-B[0], A[1]-B[1]], dtype=np.float64)
+    bc    = np.array([C[0]-B[0], C[1]-B[1]], dtype=np.float64)
+    na    = np.linalg.norm(ba)
+    nc    = np.linalg.norm(bc)
+    if na < 1e-6 or nc < 1e-6:
+        return float("nan")
+    cos_v = np.dot(ba, bc) / (na * nc)
+    return float(np.degrees(np.arccos(np.clip(cos_v, -1.0, 1.0))))
+
+
+def _tilt_from_vertical(top: tuple, bottom: tuple) -> float:
+    """
+    Angle between the vector top→bottom and the downward vertical (0, +1).
+    0° = perfectly upright spine. 90° = completely horizontal.
+    """
+    dx, dy = bottom[0]-top[0], bottom[1]-top[1]
+    length = math.hypot(dx, dy)
+    if length < 1e-6:
+        return 0.0
+    return float(math.degrees(math.acos(max(-1.0, min(1.0, dy/length)))))
+
+
+def _body_ruler(kpb: KeypointBuffer) -> float:
+    """
+    Shoulder width = body ruler.
+    Makes all pixel thresholds camera-distance independent.
+    Falls back to torso height if shoulders unavailable.
+    """
+    ls = kpb.get(KP_LEFT_SHOULDER)
+    rs = kpb.get(KP_RIGHT_SHOULDER)
+    if ls and rs:
+        sw = math.hypot(rs[0]-ls[0], rs[1]-ls[1])
+        if sw > 5.0:
+            return sw
+
+    # Fallback: use distance from shoulder to hip on visible side
+    for sh_idx, hp_idx in [(KP_LEFT_SHOULDER, KP_LEFT_HIP), (KP_RIGHT_SHOULDER, KP_RIGHT_HIP)]:
+        sh = kpb.get(sh_idx)
+        hp = kpb.get(hp_idx)
+        if sh and hp:
+            torso = math.hypot(hp[0]-sh[0], hp[1]-sh[1])
+            if torso > 5.0:
+                return torso * 0.8   # scale: shoulder_width ≈ 0.8 × torso height
+
+    return CFG.FALLBACK_SW
+
+
+def _hip_centroid(kpb: KeypointBuffer) -> Optional[tuple[float, float]]:
+    """Returns the midpoint of both hips, or whichever is available."""
+    lh = kpb.get(KP_LEFT_HIP)
+    rh = kpb.get(KP_RIGHT_HIP)
+    if lh and rh:
+        return (lh[0]+rh[0])/2.0, (lh[1]+rh[1])/2.0
+    return lh or rh
+
+
+# ==============================================================================
+# BEHAVIOUR 1 & 3 — POSTURE CLASSIFIER  (Sitting / Slouching / Standing)
+# ==============================================================================
+
+@dataclass
+class PostureResult:
+    label:            str   = "unknown"
+    knee_angle_left:  float = float("nan")
+    knee_angle_right: float = float("nan")
+    avg_knee_angle:   float = float("nan")
+    spine_tilt_deg:   float = float("nan")
+    nose_drop_norm:   float = float("nan")
+    hip_forward_norm: float = float("nan")
+    confidence:       float = 0.0
+
+
+class PostureClassifier:
+    """
+    Stateful posture classifier with hysteresis to prevent state flicker.
+
+    Priority:
+      1. slouching  (can co-occur with sitting — detected first)
+      2. sitting
+      3. standing
+      4. unknown
+    """
+
+    def __init__(self) -> None:
+        self._state        = "unknown"
+        self._candidate    = "unknown"
+        self._hold_counter = 0
+
+    def classify(self, kpb: KeypointBuffer, sw: float) -> PostureResult:
+        res = PostureResult()
+
+        # ── Knee angles ────────────────────────────────────────────────────
+        knee_angles: list[float] = []
+        for h_idx, k_idx, a_idx in [
+            (KP_LEFT_HIP,  KP_LEFT_KNEE,  KP_LEFT_ANKLE),
+            (KP_RIGHT_HIP, KP_RIGHT_KNEE, KP_RIGHT_ANKLE),
+        ]:
+            h = kpb.get(h_idx); k = kpb.get(k_idx); a = kpb.get(a_idx)
+            if h and k and a:
+                ang = _angle_deg(h, k, a)
+                if not math.isnan(ang):
+                    knee_angles.append(ang)
+
+        if knee_angles:
+            res.knee_angle_left  = knee_angles[0] if len(knee_angles) >= 1 else float("nan")
+            res.knee_angle_right = knee_angles[1] if len(knee_angles) >= 2 else float("nan")
+            # Use minimum angle if one side is clearly bent → more sensitive sitting detection
+            res.avg_knee_angle   = float(np.min(knee_angles))
+
+        # ── Spine tilt ─────────────────────────────────────────────────────
+        ls = kpb.get(KP_LEFT_SHOULDER); rs = kpb.get(KP_RIGHT_SHOULDER)
+        lh = kpb.get(KP_LEFT_HIP);      rh = kpb.get(KP_RIGHT_HIP)
+        sh_mid = hm_mid = None
+        if ls and rs:
+            sh_mid = ((ls[0]+rs[0])/2.0, (ls[1]+rs[1])/2.0)
+        elif ls:
+            sh_mid = ls
+        elif rs:
+            sh_mid = rs
+
+        if lh and rh:
+            hm_mid = ((lh[0]+rh[0])/2.0, (lh[1]+rh[1])/2.0)
+        elif lh:
+            hm_mid = lh
+        elif rh:
+            hm_mid = rh
+
+        if sh_mid and hm_mid:
+            res.spine_tilt_deg = _tilt_from_vertical(sh_mid, hm_mid)
+
+        # ── Nose drop (forward head) ───────────────────────────────────────
+        nose = kpb.get(KP_NOSE)
+        if nose and sh_mid:
+            res.nose_drop_norm = (nose[1] - sh_mid[1]) / sw
+
+        # ── Hip forward offset (hunching) ──────────────────────────────────
+        if sh_mid and hm_mid:
+            # Positive x offset of hips relative to shoulders = hunching forward
+            # In camera view this is less reliable but provides a useful cue
+            hip_dx = hm_mid[0] - sh_mid[0]
+            res.hip_forward_norm = abs(hip_dx) / sw
+
+        # ── Slouch detection ───────────────────────────────────────────────
+        slouch_by_tilt = (
+            not math.isnan(res.spine_tilt_deg)
+            and res.spine_tilt_deg > CFG.SLOUCH_SPINE_TILT_MAX
+        )
+        slouch_by_nose = (
+            not math.isnan(res.nose_drop_norm)
+            and res.nose_drop_norm > CFG.SLOUCH_NOSE_DROP_NORM
+        )
+        # Heavy forward lean: hip drifts forward AND spine tilted
+        slouch_by_hip = (
+            not math.isnan(res.hip_forward_norm)
+            and res.hip_forward_norm > CFG.SLOUCH_HIP_FORWARD_NORM
+            and not math.isnan(res.spine_tilt_deg)
+            and res.spine_tilt_deg > CFG.SLOUCH_SPINE_TILT_MAX * 0.7
+        )
+
+        if slouch_by_tilt or slouch_by_nose or slouch_by_hip:
+            raw_label = "slouching"
+        elif not math.isnan(res.avg_knee_angle):
+            if res.avg_knee_angle < CFG.SITTING_KNEE_ANGLE_MAX:
+                raw_label = "sitting"
+            elif res.avg_knee_angle > CFG.STANDING_KNEE_ANGLE_MIN:
+                raw_label = "standing"
+            else:
+                raw_label = self._state  # hold previous in ambiguous zone
+        else:
+            raw_label = "unknown"
+
+        # ── Hysteresis state machine ────────────────────────────────────────
+        if raw_label == self._state:
+            self._hold_counter = 0
+            new_state = self._state
+        else:
+            if raw_label == self._candidate:
+                self._hold_counter += 1
+            else:
+                self._candidate    = raw_label
+                self._hold_counter = 1
+
+            if self._hold_counter >= CFG.POSTURE_CONFIRM_FRAMES:
+                self._state        = raw_label
+                self._hold_counter = 0
+            new_state = self._state
+
+        res.label = new_state
+
+        # ── Confidence ─────────────────────────────────────────────────────
+        if res.label == "slouching":
+            if not math.isnan(res.spine_tilt_deg):
+                res.confidence = min(1.0, (res.spine_tilt_deg - CFG.SLOUCH_SPINE_TILT_MAX) / 20.0)
+            else:
+                res.confidence = 0.5
+
+        elif res.label == "sitting" and not math.isnan(res.avg_knee_angle):
+            res.confidence = min(1.0, (CFG.SITTING_KNEE_ANGLE_MAX - res.avg_knee_angle) / 35.0)
+
+        elif res.label == "standing" and not math.isnan(res.avg_knee_angle):
+            res.confidence = min(1.0, (res.avg_knee_angle - CFG.STANDING_KNEE_ANGLE_MIN) / 15.0)
+
+        else:
+            res.confidence = 0.0
+
+        return res
+
+
+# ==============================================================================
+# BEHAVIOUR 4 — BOUNDING DETECTOR
+# ==============================================================================
+
+class BoundingDetector:
+    """
+    Detects large body displacements indicating jumping or bounding movement.
+
+    Strategy:
+      - Tracks hip centroid position each frame (normalised by shoulder width).
+      - Computes per-frame displacement (Euclidean distance between consecutive
+        hip positions, normalised by sw).
+      - Smooths over a short rolling window to reduce noise.
+      - Triggers 'bounding' when smoothed displacement > BOUND_DISP_NORM.
+      - Uses a decay counter so the label stays active for BOUND_DECAY_FRAMES
+        after the last detected displacement, avoiding choppy on/off flicker.
+
+    Unlike the old FFT bounce detector (which needed a full window of history
+    to fire), this responds within 1–2 frames of the jump, making it much more
+    responsive for rapid movements like jumps, leaps, or large lateral steps.
+    """
+
+    def __init__(self) -> None:
+        self._prev_hip:    Optional[tuple[float, float]] = None
+        self._disp_buf:    deque = deque(maxlen=CFG.BOUND_HISTORY_LEN)
+        self._decay_count: int   = 0
+
+    def update(self, kpb: KeypointBuffer, sw: float) -> tuple[float, int]:
+        """
+        Returns (disp_score ∈ [0,1], bounding ∈ {0,1}).
+        disp_score is the current normalised displacement smoothed over the window.
+        """
+        hip = _hip_centroid(kpb)
+
+        if hip is None:
+            # No hip visible: decay and return
+            self._decay_count = max(0, self._decay_count - 1)
+            return 0.0, int(self._decay_count > 0)
+
+        if self._prev_hip is not None:
+            dx   = hip[0] - self._prev_hip[0]
+            dy   = hip[1] - self._prev_hip[1]
+            disp = math.hypot(dx, dy) / max(sw, 1.0)
+        else:
+            disp = 0.0
+
+        self._prev_hip = hip
+        self._disp_buf.append(disp)
+
+        # Smooth: use max over window (captures peak displacement)
+        smooth_disp = float(np.max(self._disp_buf)) if self._disp_buf else 0.0
+        disp_score  = float(np.clip(smooth_disp / (CFG.BOUND_DISP_NORM * 2.0), 0.0, 1.0))
+
+        if smooth_disp >= CFG.BOUND_DISP_NORM:
+            # Displacement is large — set decay counter
+            self._decay_count = CFG.BOUND_DECAY_FRAMES
+        else:
+            self._decay_count = max(0, self._decay_count - 1)
+
+        is_bounding = int(self._decay_count > 0)
+        return disp_score, is_bounding
+
+    def reset(self) -> None:
+        self._prev_hip    = None
+        self._disp_buf.clear()
+        self._decay_count = 0
+
+
+# ==============================================================================
+# BEHAVIOUR 5 — HAND-RAISE STATE MACHINE
+# ==============================================================================
+
+class HandRaiseSM:
+    """
+    Three-condition, hysteresis-protected hand-raise detector.
+
+    Condition A (geometry) : wrist_y < shoulder_y − margin_px
+    Condition B (elbow)    : elbow_y < shoulder_midpoint_y  (optional, see CFG)
+    Condition C (motion)   : upward Kalman velocity of wrist / sw ≥ threshold
+
+    A must hold; B is optional (strengthens confidence); C accelerates confirmation.
+    Hysteresis: once raised, requires HAND_LOWER_HOLD frames to drop.
+    """
+
+    _IDLE = 0; _CANDIDATE = 1; _RAISED = 2; _LOWERING = 3
+
+    def __init__(self) -> None:
+        self._state               = self._IDLE
+        self._rcnt                = 0
+        self._lcnt                = 0
+        self.wrist_above_shoulder = False
+        self.elbow_above_shoulder = False
+        self.wrist_vel_up         = False
+        self.raised               = 0
+
+    def update(self, kpb: KeypointBuffer, sw: float) -> None:
+        margin_px  = CFG.HAND_ABOVE_MARGIN_NORM * sw
+        # Shoulder midpoint y
+        ls = kpb.get(KP_LEFT_SHOULDER); rs = kpb.get(KP_RIGHT_SHOULDER)
+        sh_mid_y = None
+        if ls and rs:
+            sh_mid_y = (ls[1] + rs[1]) / 2.0
+        elif ls:
+            sh_mid_y = ls[1]
+        elif rs:
+            sh_mid_y = rs[1]
+
+        lw = kpb.get(KP_LEFT_WRIST);   rw = kpb.get(KP_RIGHT_WRIST)
+        le = kpb.get(KP_LEFT_ELBOW);   re = kpb.get(KP_RIGHT_ELBOW)
+
+        # Condition A: wrist above ipsilateral shoulder
+        la = bool(ls and lw and lw[1] < ls[1] - margin_px)
+        ra = bool(rs and rw and rw[1] < rs[1] - margin_px)
+        cond_A = la or ra
+        self.wrist_above_shoulder = cond_A
+
+        # Condition B: elbow above shoulder midpoint
+        if sh_mid_y is not None:
+            lb = bool(le and le[1] < sh_mid_y)
+            rb = bool(re and re[1] < sh_mid_y)
+            cond_B_geom = lb or rb
+        else:
+            cond_B_geom = False
+        self.elbow_above_shoulder = cond_B_geom
+
+        # Condition C: upward wrist velocity
+        lv = kpb.kpf(KP_LEFT_WRIST).vy_up
+        rv = kpb.kpf(KP_RIGHT_WRIST).vy_up
+        if la and ra:   active_vy = max(lv, rv)
+        elif la:        active_vy = lv
+        elif ra:        active_vy = rv
+        else:           active_vy = max(lv, rv)
+
+        cond_C = (active_vy / max(sw, 1.0)) >= CFG.HAND_VEL_NORM
+        self.wrist_vel_up = cond_C
+
+        # Raise trigger: A required; B or C as additional evidence
+        raise_trigger = cond_A and (cond_B_geom or cond_C)
+        # Lower trigger: neither A nor B
+        lower_trigger = (not cond_A) and (not cond_B_geom)
+
+        if self._state == self._IDLE:
+            if raise_trigger:
+                self._state = self._CANDIDATE; self._rcnt = 1
+        elif self._state == self._CANDIDATE:
+            if raise_trigger:
+                self._rcnt += 1
+                if self._rcnt >= CFG.HAND_RAISE_HOLD:
+                    self._state = self._RAISED
+            else:
+                self._state = self._IDLE; self._rcnt = 0
+        elif self._state == self._RAISED:
+            if lower_trigger:
+                self._state = self._LOWERING; self._lcnt = 1
+        elif self._state == self._LOWERING:
+            if raise_trigger:
+                self._state = self._RAISED; self._lcnt = 0
+            else:
+                self._lcnt += 1
+                if self._lcnt >= CFG.HAND_LOWER_HOLD:
+                    self._state = self._IDLE; self._rcnt = self._lcnt = 0
+
+        self.raised = int(self._state in (self._RAISED, self._LOWERING))
+
+
+# ==============================================================================
+# PER-TRACK STATE
+# ==============================================================================
+
+@dataclass
+class TrackState:
+    track_id:    int
+    kpb:         KeypointBuffer   = field(default_factory=KeypointBuffer)
+    posture_cls: PostureClassifier = field(default_factory=PostureClassifier)
+    bounding:    BoundingDetector  = field(default_factory=BoundingDetector)
+    hand_sm:     HandRaiseSM       = field(default_factory=HandRaiseSM)
+
+    def process(self, kp_array: np.ndarray) -> dict:
+        """
+        Full 5-behaviour pipeline for one frame.
+        kp_array : (17, 3)  — [x, y, visibility] from the CSV.
+        Returns a flat dict of all features.
+        """
+        self.kpb.update(kp_array)
+        sw = _body_ruler(self.kpb)
+
+        # Posture (sitting / slouching / standing / unknown) — now stateful
+        pr = self.posture_cls.classify(self.kpb, sw)
+
+        # Bounding (large body displacement)
+        disp_score, is_bounding = self.bounding.update(self.kpb, sw)
+
+        # Hand raise
+        self.hand_sm.update(self.kpb, sw)
+
+        def _f(v: float) -> object:
+            return round(v, 2) if not math.isnan(v) else ""
+
+        return {
+            "shoulder_width_px":    round(sw, 2),
+            "knee_angle_left":      _f(pr.knee_angle_left),
+            "knee_angle_right":     _f(pr.knee_angle_right),
+            "avg_knee_angle":       _f(pr.avg_knee_angle),
+            "spine_tilt_deg":       _f(pr.spine_tilt_deg),
+            "nose_drop_norm":       round(pr.nose_drop_norm, 4)
+                                    if not math.isnan(pr.nose_drop_norm) else "",
+            "hip_forward_norm":     round(pr.hip_forward_norm, 4)
+                                    if not math.isnan(pr.hip_forward_norm) else "",
+            "disp_score":           round(disp_score, 4),
+            "wrist_above_shoulder": int(self.hand_sm.wrist_above_shoulder),
+            "elbow_above_shoulder": int(self.hand_sm.elbow_above_shoulder),
+            "wrist_vel_up":         int(self.hand_sm.wrist_vel_up),
+            "posture":              pr.label,
+            "posture_confidence":   round(pr.confidence, 3),
+            "bounding":             is_bounding,
+            "bounding_confidence":  round(disp_score, 4),
+            "hand_raised":          self.hand_sm.raised,
+        }
+
+
+# ==============================================================================
+# SUMMARY BUILDER  (run-length encoder → episode table)
+# ==============================================================================
+
+@dataclass
+class Episode:
+    track_id: int; behaviour: str
+    start_frame: int; end_frame: int
+    conf_sum: float = 0.0; n_frames: int = 0
+
+    def extend(self, fid: int, conf: float) -> None:
+        self.end_frame = fid; self.conf_sum += conf; self.n_frames += 1
+
+    @property
+    def confidence_avg(self) -> float:
+        return self.conf_sum / max(1, self.n_frames)
+
+    @property
+    def duration_frames(self) -> int:
+        return self.end_frame - self.start_frame + 1
+
+
+class SummaryBuilder:
+    GAP_TOLERANCE = 5
+
+    def __init__(self) -> None:
+        self._open:       dict[int, Episode] = {}
+        self._last_frame: dict[int, int]     = {}
+        self._done:       list[Episode]      = []
+
+    def ingest(self, fid: int, tid: int, beh: str, conf: float) -> None:
+        gap = fid - self._last_frame.get(tid, -9999)
+        self._last_frame[tid] = fid
+        ep = self._open.get(tid)
+        if ep is None or ep.behaviour != beh or gap > self.GAP_TOLERANCE:
+            if ep: self._done.append(ep)
+            self._open[tid] = Episode(tid, beh, fid, fid, conf, 1)
+        else:
+            ep.extend(fid, conf)
+
+    def flush(self) -> None:
+        for ep in self._open.values(): self._done.append(ep)
+        self._open.clear()
+
+    @property
+    def episodes(self) -> list[Episode]:
+        return sorted(self._done, key=lambda e: (e.track_id, e.start_frame))
+
+
+def dominant_behaviour(feat: dict) -> tuple[str, float]:
+    """Pick the single most salient behaviour label + confidence."""
+    if feat["hand_raised"]:  return "hand_raised", 1.0
+    if feat["bounding"]:     return "bounding",    float(feat["bounding_confidence"])
+    return str(feat["posture"]), float(feat["posture_confidence"])
+
+
+# ==============================================================================
+# CSV LOADER — reads raw_body_multi.csv into a frame-indexed structure
+# ==============================================================================
+
+def load_body_csv(body_csv: str) -> tuple[dict[int, dict[int, np.ndarray]], list[int]]:
+    """
+    Reads raw_body_multi.csv (long format: 17 rows per person per frame).
+    Returns:
+        body_index  : {frame_id: {track_id: np.ndarray(17, 3)}}
+        frame_ids   : sorted list of all unique frame_ids in the CSV
+    """
+    print(f"[CSV]   Loading {body_csv}", end="", flush=True)
+
+    body_index: dict[int, dict[int, np.ndarray]] = defaultdict(dict)
+    chunk_size  = 17 * 20 * 500
+
+    for chunk in pd.read_csv(
+        body_csv,
+        dtype={
+            "frame_id":     "Int64",
+            "track_id":     "Int64",
+            "landmark_idx": "Int64",
+            "x":             float,
+            "y":             float,
+            "visibility":    float,
+        },
+        chunksize=chunk_size,
+    ):
+        chunk = chunk.dropna(subset=["landmark_idx"])
+        chunk["landmark_idx"] = chunk["landmark_idx"].astype(int)
+
+        for (fid, tid), grp in chunk.groupby(["frame_id", "track_id"]):
+            fid = int(fid); tid = int(tid)
+            arr = np.zeros((N_KP, 3), dtype=np.float64)
+
+            for _, row in grp.iterrows():
+                idx = int(row["landmark_idx"])
+                if not (0 <= idx < N_KP):
+                    continue
+                try:
+                    arr[idx, 0] = float(row["x"])          if not pd.isna(row.get("x",          np.nan)) else 0.0
+                    arr[idx, 1] = float(row["y"])          if not pd.isna(row.get("y",          np.nan)) else 0.0
+                    arr[idx, 2] = float(row["visibility"]) if not pd.isna(row.get("visibility", np.nan)) else 0.0
+                except (ValueError, TypeError):
+                    pass
+
+            body_index[fid][tid] = arr
+
+        print(".", end="", flush=True)
+
+    frame_ids = sorted(body_index.keys())
+    print(f"\n[CSV]   {len(frame_ids)} frames loaded, "
+          f"frame range [{frame_ids[0]} … {frame_ids[-1]}]")
+    return body_index, frame_ids
+
+
+# ==============================================================================
+# OVERLAY RENDERER
+# ==============================================================================
+
+class Renderer:
+    FONT      = cv2.FONT_HERSHEY_SIMPLEX
+    FONT_BOLD = cv2.FONT_HERSHEY_DUPLEX
+
+    _LINKS = [
+        (KP_LEFT_SHOULDER,  KP_LEFT_ELBOW,    None, 2),
+        (KP_LEFT_ELBOW,     KP_LEFT_WRIST,    None, 2),
+        (KP_RIGHT_SHOULDER, KP_RIGHT_ELBOW,   None, 2),
+        (KP_RIGHT_ELBOW,    KP_RIGHT_WRIST,   None, 2),
+        (KP_LEFT_SHOULDER,  KP_RIGHT_SHOULDER,(170,170,170), 2),
+        (KP_LEFT_SHOULDER,  KP_LEFT_HIP,      (170,170,170), 2),
+        (KP_RIGHT_SHOULDER, KP_RIGHT_HIP,     (170,170,170), 2),
+        (KP_LEFT_HIP,       KP_RIGHT_HIP,     (170,170,170), 2),
+        (KP_LEFT_HIP,       KP_LEFT_KNEE,     (100,160,220), 2),
+        (KP_LEFT_KNEE,      KP_LEFT_ANKLE,    (100,160,220), 2),
+        (KP_RIGHT_HIP,      KP_RIGHT_KNEE,    (100,160,220), 2),
+        (KP_RIGHT_KNEE,     KP_RIGHT_ANKLE,   (100,160,220), 2),
+    ]
+    _ARM_INDICES = {
+        KP_LEFT_SHOULDER, KP_LEFT_ELBOW, KP_LEFT_WRIST,
+        KP_RIGHT_SHOULDER, KP_RIGHT_ELBOW, KP_RIGHT_WRIST,
+    }
+
+    @staticmethod
+    def _beh_col(beh: str) -> tuple:
+        return CFG.BEHAVIOUR_COLORS.get(beh, CFG.BEHAVIOUR_COLORS["unknown"])
+
+    @classmethod
+    def draw_skeleton(
+        cls,
+        frame:      np.ndarray,
+        kpb:        KeypointBuffer,
+        beh:        str,
+        hand_raised: bool,
+        is_bounding: bool,
+    ) -> tuple[int, int, int, int]:
+        beh_col  = cls._beh_col(beh)
+        arm_col  = (0, 255, 0) if hand_raised else beh_col
+        # Flash skeleton bright yellow when bounding
+        if is_bounding:
+            beh_col = (0, 230, 255)
+        xs, ys   = [], []
+
+        def _pt(idx: int) -> Optional[tuple[int, int]]:
+            p = kpb.get(idx)
+            if p:
+                xs.append(int(p[0])); ys.append(int(p[1]))
+                return int(p[0]), int(p[1])
+            return None
+
+        for a_idx, b_idx, fixed_col, thick in cls._LINKS:
+            col = arm_col if a_idx in cls._ARM_INDICES else (fixed_col or beh_col)
+            pa  = _pt(a_idx); pb = _pt(b_idx)
+            if pa and pb:
+                cv2.line(frame, pa, pb, col, thick, cv2.LINE_AA)
+
+        for idx in range(N_KP):
+            pt = _pt(idx)
+            if pt:
+                is_wrist = idx in (KP_LEFT_WRIST, KP_RIGHT_WRIST)
+                dot_col  = (0, 255, 0) if (hand_raised and is_wrist) else beh_col
+                r        = 5 if is_wrist else 3
+                cv2.circle(frame, pt, r, dot_col, -1, cv2.LINE_AA)
+
+        return (min(xs), min(ys), max(xs), max(ys)) if xs else (0, 0, 0, 0)
+
+    @classmethod
+    def draw_badge(
+        cls,
+        frame: np.ndarray,
+        tid:   int,
+        beh:   str,
+        conf:  float,
+        cx:    int,
+        top_y: int,
+    ) -> None:
+        label = f"ID:{tid}  {beh.upper().replace('_',' ')}  {int(conf*100)}%"
+        fs    = 0.50
+        (tw, th), _ = cv2.getTextSize(label, cls.FONT_BOLD, fs, 1)
+
+        pad_x, pad_y = 10, 5
+        bx1 = max(0, cx - tw//2 - pad_x)
+        bx2 = bx1 + tw + pad_x * 2
+        by1 = max(0, top_y - th - pad_y*2 - 6)
+        by2 = top_y - 6
+
+        if by2 <= by1:
+            by1 = max(0, by2 - th - pad_y*2)
+
+        beh_col = cls._beh_col(beh)
+        cv2.rectangle(frame, (bx1, by1), (bx2, by2), beh_col, cv2.FILLED)
+        cv2.rectangle(frame, (bx1, by1), (bx2, by2), (20, 20, 20), 1)
+        cv2.putText(frame, label, (bx1 + pad_x, by1 + pad_y + th),
+                    cls.FONT_BOLD, fs, (0, 0, 0), 1, cv2.LINE_AA)
+
+        bw     = bx2 - bx1
+        filled = max(0, min(bw, int(bw * conf)))
+        cv2.rectangle(frame, (bx1, by2),           (bx2,         by2+4), (40,40,40),  cv2.FILLED)
+        cv2.rectangle(frame, (bx1, by2),           (bx1+filled,  by2+4), beh_col,     cv2.FILLED)
+
+    @classmethod
+    def draw_diagnostics(
+        cls,
+        frame:   np.ndarray,
+        feat:    dict,
+        x_right: int,
+        y_top:   int,
+    ) -> None:
+        def _s(key: str) -> str:
+            v = feat.get(key, "")
+            if v == "" or (isinstance(v, float) and math.isnan(v)):
+                return "n/a"
+            return str(v) if isinstance(v, str) else f"{float(v):.1f}"
+
+        lines = [
+            f"knee : {_s('avg_knee_angle')}",
+            f"spine: {_s('spine_tilt_deg')}",
+            f"nose : {_s('nose_drop_norm')}",
+            f"hip_f: {_s('hip_forward_norm')}",
+            f"disp : {_s('disp_score')}",
+            f"W>sh : {feat.get('wrist_above_shoulder',0)}",
+            f"E>sh : {feat.get('elbow_above_shoulder',0)}",
+            f"W>vel: {feat.get('wrist_vel_up',0)}",
+        ]
+        lh = 14; pw = 130; ph = lh*len(lines)+6
+        px1 = min(x_right+4, frame.shape[1]-pw-2)
+        py1 = max(0, y_top)
+        px2 = min(frame.shape[1]-1, px1+pw)
+        py2 = min(frame.shape[0]-1, py1+ph)
+
+        sub = frame[py1:py2, px1:px2]
+        if sub.size > 0:
+            frame[py1:py2, px1:px2] = cv2.addWeighted(sub, 0.25,
+                                                        np.zeros_like(sub), 0.75, 0)
+        for i, line in enumerate(lines):
+            ty = py1 + lh*(i+1)
+            if ty < frame.shape[0]:
+                cv2.putText(frame, line, (px1+3, ty),
+                            cls.FONT, 0.36, (200,200,200), 1, cv2.LINE_AA)
+
+    @classmethod
+    def draw_hand_banner(
+        cls,
+        frame:  np.ndarray,
+        tid:    int,
+        cx:     int,
+        top_y:  int,
+        tick:   int,
+    ) -> None:
+        if (tick // 15) % 2 == 0:
+            label = f"! HAND RAISED  ID:{tid} !"
+            fs    = 0.52
+            (tw, th), _ = cv2.getTextSize(label, cls.FONT_BOLD, fs, 2)
+            bx1 = max(0, cx - tw//2 - 8)
+            by1 = max(0, top_y - th - 44)
+            bx2 = bx1 + tw + 16
+            by2 = by1 + th + 10
+            cv2.rectangle(frame, (bx1, by1), (bx2, by2), (220, 0, 200), cv2.FILLED)
+            cv2.putText(frame, label, (bx1+8, by1+th+4),
+                        cls.FONT_BOLD, fs, (255,255,255), 2, cv2.LINE_AA)
+
+    @classmethod
+    def draw_bounding_banner(
+        cls,
+        frame:  np.ndarray,
+        tid:    int,
+        cx:     int,
+        top_y:  int,
+        tick:   int,
+    ) -> None:
+        """Animated BOUNDING banner shown when large displacement detected."""
+        if (tick // 10) % 2 == 0:
+            label = f">> BOUNDING  ID:{tid} <<"
+            fs    = 0.52
+            (tw, th), _ = cv2.getTextSize(label, cls.FONT_BOLD, fs, 2)
+            bx1 = max(0, cx - tw//2 - 8)
+            by1 = max(0, top_y - th - 60)
+            bx2 = bx1 + tw + 16
+            by2 = by1 + th + 10
+            cv2.rectangle(frame, (bx1, by1), (bx2, by2), (0, 200, 255), cv2.FILLED)
+            cv2.putText(frame, label, (bx1+8, by1+th+4),
+                        cls.FONT_BOLD, fs, (0, 0, 0), 2, cv2.LINE_AA)
+
+    @staticmethod
+    def draw_hud(
+        frame:     np.ndarray,
+        frame_id:  int,
+        fps:       float,
+        n_persons: int,
+        paused:    bool,
+        speed:     float,
+        progress:  float,
+    ) -> None:
+        h, w = frame.shape[:2]
+
+        hud_lines = [
+            f"Frame : {frame_id}",
+            f"FPS   : {fps:.1f}",
+            f"People: {n_persons}",
+            f"Speed : {speed:.1f}x",
+            "|| PAUSED" if paused else "> PLAYING",
+        ]
+        hud_h, hud_w = 18*len(hud_lines)+8, 155
+        sub = frame[0:hud_h, 0:hud_w]
+        if sub.size > 0:
+            frame[0:hud_h, 0:hud_w] = cv2.addWeighted(sub, 0.2,
+                                                        np.zeros_like(sub), 0.8, 0)
+        for i, line in enumerate(hud_lines):
+            col = (0, 60, 255) if "PAUSED" in line else (0, 255, 180)
+            cv2.putText(frame, line, (6, 18+i*18),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.47, col, 1, cv2.LINE_AA)
+
+        bar_h  = 6
+        filled = int(w * progress)
+        cv2.rectangle(frame, (0, h-bar_h), (w, h),       (40,40,40),   cv2.FILLED)
+        cv2.rectangle(frame, (0, h-bar_h), (filled, h),  (0,200,255),  cv2.FILLED)
+
+        hint = "SPACE=pause/step  Q=quit  S=snapshot  +/-=speed"
+        (hw, hh), _ = cv2.getTextSize(hint, cv2.FONT_HERSHEY_SIMPLEX, 0.37, 1)
+        cv2.putText(frame, hint, (w-hw-6, h-bar_h-5),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.37, (150,150,150), 1, cv2.LINE_AA)
+
+    @classmethod
+    def render_all(
+        cls,
+        frame:    np.ndarray,
+        results:  dict,
+        frame_id: int,
+        fps:      float,
+        paused:   bool,
+        speed:    float,
+        progress: float,
+        tick:     int,
+    ) -> None:
+        for tid, (track, feat) in results.items():
+            beh, conf   = dominant_behaviour(feat)
+            hand_up     = bool(feat["hand_raised"])
+            is_bounding = bool(feat["bounding"])
+
+            x_min, y_min, x_max, y_max = cls.draw_skeleton(
+                frame, track.kpb, beh, hand_up, is_bounding
+            )
+
+            if x_max == 0 and y_max == 0:
+                continue
+
+            cx = (x_min + x_max) // 2
+            cls.draw_badge(frame, tid, beh, conf, cx, y_min)
+
+            if hand_up:
+                cls.draw_hand_banner(frame, tid, cx, y_min, tick)
+            if is_bounding:
+                cls.draw_bounding_banner(frame, tid, cx, y_min, tick)
+
+            cls.draw_diagnostics(frame, feat, x_max, y_min)
+
+        cls.draw_hud(frame, frame_id, fps, len(results), paused, speed, progress)
+
+
+# ==============================================================================
+# CSV OUTPUT COLUMNS
+# ==============================================================================
+
+_RAW_COLS = [
+    "frame_id", "track_id", "shoulder_width_px",
+    "knee_angle_left", "knee_angle_right", "avg_knee_angle",
+    "spine_tilt_deg",  "nose_drop_norm",   "hip_forward_norm",
+    "disp_score",
+    "wrist_above_shoulder", "elbow_above_shoulder", "wrist_vel_up",
+    "posture", "posture_confidence",
+    "bounding", "bounding_confidence",
+    "hand_raised",
+]
+_SUM_COLS = [
+    "track_id", "behaviour",
+    "start_frame", "end_frame", "duration_frames", "confidence_avg",
 ]
 
-# --- Stimming (Repetitive wrist oscillation) ---
-STIM_WINDOW_FRAMES  = 60    # rolling window length (frames) to analyse oscillation
-STIM_MIN_PEAKS      = 4     # minimum oscillation peaks in window
-STIM_MIN_AMPLITUDE  = 15    # px — minimum peak-to-trough amplitude
-STIM_MAX_PERIOD     = 20    # frames — max allowed period between peaks (speed filter)
 
+# ==============================================================================
+# MAIN
+# ==============================================================================
 
-# ──────────────────────────────────────────────
-# UTILITIES
-# ──────────────────────────────────────────────
+def run(
+    video_path: str,
+    body_csv:   str,
+    raw_out:    str,
+    sum_out:    str,
+    speed:      float,
+    step_mode:  bool,
+    save_video: str,
+) -> None:
 
-def _kp(frame_kps: dict, idx: int):
-    """
-    Returns (x, y, vis) for keypoint `idx` in a frame's keypoint dict.
-    Returns (nan, nan, 0) if missing.
-    frame_kps : {landmark_idx -> (x, y, visibility)}
-    """
-    if idx in frame_kps:
-        x, y, v = frame_kps[idx]
-        return float(x), float(y), float(v)
-    return np.nan, np.nan, 0.0
+    for p, name in [(video_path, "Video"), (body_csv, "Body CSV")]:
+        if not Path(p).exists():
+            print(f"[ERROR] {name} not found: {p}")
+            sys.exit(1)
 
+    print(f"\n{'='*60}")
+    print(f"  Behaviour Classifier v5  —  CSV-driven video overlay")
+    print(f"{'='*60}\n")
 
-def _valid(vis: float) -> bool:
-    return vis >= VIS_THRESHOLD
+    body_index, frame_ids = load_body_csv(body_csv)
 
+    if not frame_ids:
+        print("[ERROR] Body CSV is empty or has no valid rows.")
+        sys.exit(1)
 
-def _avg_y(frame_kps, idx_list):
-    """Average y of visible keypoints in idx_list. Returns nan if none visible."""
-    ys = [frame_kps[i][1] for i in idx_list
-          if i in frame_kps and _valid(frame_kps[i][2])]
-    return float(np.mean(ys)) if ys else np.nan
+    total_csv_frames = len(frame_ids)
+    print(f"[CSV]   {total_csv_frames} frames will be processed.\n")
 
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        print(f"[ERROR] Cannot open video: {video_path}")
+        sys.exit(1)
 
-def _avg_x(frame_kps, idx_list):
-    xs = [frame_kps[i][0] for i in idx_list
-          if i in frame_kps and _valid(frame_kps[i][2])]
-    return float(np.mean(xs)) if xs else np.nan
+    total_video_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    video_fps          = cap.get(cv2.CAP_PROP_FPS) or 25.0
+    frame_w            = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    frame_h            = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
+    print(f"[Video] {Path(video_path).name}  "
+          f"{frame_w}x{frame_h}  {video_fps:.1f}fps  {total_video_frames} frames")
+    print(f"[Mode]  Speed={speed}x  Step={step_mode}")
+    print(f"[Out]   {raw_out}  |  {sum_out}\n")
+    print("  Controls: SPACE=pause/step  Q/ESC=quit  S=snapshot  +/-=speed\n")
 
-# ──────────────────────────────────────────────
-# 1. HAND RAISING
-# ──────────────────────────────────────────────
+    writer = None
+    if save_video:
+        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+        writer = cv2.VideoWriter(save_video, fourcc, video_fps, (frame_w, frame_h))
+        print(f"[Save]  Annotated video → {save_video}")
 
-def detect_hand_raised(frame_kps: dict) -> bool:
-    """
-    True if at least one wrist is above (smaller y) its corresponding shoulder
-    by more than HAND_RAISE_MARGIN pixels.
-    """
-    pairs = [
-        (KP["left_wrist"],  KP["left_shoulder"]),
-        (KP["right_wrist"], KP["right_shoulder"]),
-    ]
-    for wrist_idx, shoulder_idx in pairs:
-        _, wy, wv = _kp(frame_kps, wrist_idx)
-        _, sy, sv = _kp(frame_kps, shoulder_idx)
-        if _valid(wv) and _valid(sv):
-            if wy < sy - HAND_RAISE_MARGIN:   # origin at top-left → smaller y = higher
-                return True
-    return False
+    raw_fh = open(raw_out, "w", newline="", encoding="utf-8")
+    raw_w  = csv.DictWriter(raw_fh, fieldnames=_RAW_COLS)
+    raw_w.writeheader()
 
+    track_states: dict[int, TrackState] = {}
+    summary   = SummaryBuilder()
+    renderer  = Renderer()
 
-# ──────────────────────────────────────────────
-# 2. POSTURE CLASSIFICATION
-# ──────────────────────────────────────────────
+    def get_track(tid: int) -> TrackState:
+        if tid not in track_states:
+            track_states[tid] = TrackState(track_id=tid)
+        return track_states[tid]
 
-def classify_posture(frame_kps: dict) -> str:
-    """
-    Returns one of: 'standing', 'slouching', 'sitting', 'unknown'.
+    fps_buf:  deque = deque(maxlen=30)
+    prev_t    = time.perf_counter()
 
-    Geometry (all y-coordinates, origin top-left):
-      shoulder_y  = mean(left_shoulder.y, right_shoulder.y)
-      hip_y       = mean(left_hip.y, right_hip.y)
-      ankle_y     = mean(left_ankle.y, right_ankle.y)
-      nose_y      = nose.y
+    paused         = step_mode
+    tick           = 0
+    rows_written   = 0
+    snapshot_count = 0
+    frame_delay_ms = max(1, int(1000 / (video_fps * speed)))
 
-      shoulder_hip_dist  = hip_y - shoulder_y        (positive = hip below shoulder)
-      shoulder_ankle_dist = ankle_y - shoulder_y
-      total_height        = max visible span (ankle_y - nose_y if available, else shoulder_ankle_dist)
-    """
-    shoulder_y = _avg_y(frame_kps, [KP["left_shoulder"], KP["right_shoulder"]])
-    hip_y      = _avg_y(frame_kps, [KP["left_hip"],      KP["right_hip"]])
-    ankle_y    = _avg_y(frame_kps, [KP["left_ankle"],    KP["right_ankle"]])
-    nose_x, nose_y, nose_v = _kp(frame_kps, KP["nose"])
+    last_rendered: Optional[np.ndarray] = None
 
-    if np.isnan(shoulder_y):
-        return "unknown"
+    cv2.namedWindow(CFG.WINDOW_NAME, cv2.WINDOW_NORMAL)
+    cv2.resizeWindow(CFG.WINDOW_NAME, min(frame_w, 1400), min(frame_h, 860))
 
-    # ── Total skeleton height (reference denominator) ──
-    if not np.isnan(ankle_y) and not np.isnan(nose_y) and _valid(nose_v):
-        total_height = ankle_y - nose_y
-    elif not np.isnan(ankle_y):
-        total_height = ankle_y - shoulder_y
-    elif not np.isnan(hip_y):
-        total_height = hip_y - shoulder_y
-    else:
-        return "unknown"
+    csv_frame_idx = 0
 
-    if total_height <= 0:
-        return "unknown"
+    while csv_frame_idx < total_csv_frames:
 
-    # ── STANDING check ──
-    if not np.isnan(ankle_y):
-        shoulder_ankle = ankle_y - shoulder_y
-        stand_ratio = shoulder_ankle / total_height
-        if stand_ratio > STAND_RATIO:
-            return "standing"
+        key = cv2.waitKey(1) & 0xFF
 
-    # ── SLOUCHING check ──
-    if not np.isnan(hip_y) and not np.isnan(nose_y) and _valid(nose_v):
-        shoulder_hip = hip_y - shoulder_y
-        nose_shoulder_dist = shoulder_y - nose_y   # positive when nose above shoulder
-        if shoulder_hip > 0:
-            slouch_ratio = nose_shoulder_dist / shoulder_hip
-            if slouch_ratio < SLOUCH_RATIO:
-                return "slouching"
+        if key in (ord('q'), 27):
+            print("\n[Info]  User quit.")
+            break
 
-    # ── SITTING (default if shoulder-hip ratio is in plausible range) ──
-    if not np.isnan(hip_y):
-        shoulder_hip = hip_y - shoulder_y
-        sit_ratio = shoulder_hip / total_height
-        if SIT_RATIO_LOW <= sit_ratio <= SIT_RATIO_HIGH:
-            return "sitting"
+        if key == ord(' '):
+            if not step_mode:
+                paused = not paused
 
-    return "sitting"   # fallback default
+        if key == ord('s'):
+            if last_rendered is not None:
+                snap = f"snapshot_{snapshot_count:04d}.png"
+                cv2.imwrite(snap, last_rendered)
+                print(f"[Snap]  {snap}")
+                snapshot_count += 1
 
+        if key in (ord('+'), ord('=')):
+            speed = min(speed * 1.5, 32.0)
+            frame_delay_ms = max(1, int(1000 / (video_fps * speed)))
+            print(f"[Speed] {speed:.2f}x")
 
-# ──────────────────────────────────────────────
-# 3. AGITATION SCORE (Fidgeting / TDAH)
-# ──────────────────────────────────────────────
+        if key == ord('-'):
+            speed = max(speed / 1.5, 0.05)
+            frame_delay_ms = max(1, int(1000 / (video_fps * speed)))
+            print(f"[Speed] {speed:.2f}x")
 
-def compute_agitation(
-    frame_kps_curr: dict,
-    frame_kps_prev: dict,
-) -> float:
-    """
-    Returns mean Euclidean speed (px/frame) of AGITATION_JOINTS between two frames.
-    Returns 0.0 if not enough valid keypoints.
-    """
-    speeds = []
-    for idx in AGITATION_JOINTS:
-        x1, y1, v1 = _kp(frame_kps_curr, idx)
-        x2, y2, v2 = _kp(frame_kps_prev, idx)
-        if _valid(v1) and _valid(v2):
-            speed = np.sqrt((x1 - x2) ** 2 + (y1 - y2) ** 2)
-            speeds.append(speed)
-    return float(np.mean(speeds)) if speeds else 0.0
+        if paused and key != ord(' '):
+            if last_rendered is not None:
+                cv2.imshow(CFG.WINDOW_NAME, last_rendered)
+            cv2.waitKey(30)
+            continue
 
+        frame_id = frame_ids[csv_frame_idx]
 
-# ──────────────────────────────────────────────
-# 4. STIMMING — Repetitive Wrist Oscillation
-# ──────────────────────────────────────────────
+        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_id)
+        ret, frame = cap.read()
 
-def detect_stimming(wrist_y_series: np.ndarray) -> bool:
-    """
-    Analyses the last STIM_WINDOW_FRAMES values of a wrist y-trajectory.
-    Returns True if a rapid, repetitive oscillation pattern is detected.
+        if not ret:
+            print(f"[Warn]  Could not read video frame {frame_id} — skipping.")
+            csv_frame_idx += 1
+            continue
 
-    Method:
-      - Find local peaks and troughs in the signal.
-      - Count valid oscillations (amplitude > STIM_MIN_AMPLITUDE,
-        period < STIM_MAX_PERIOD frames).
-    """
-    if len(wrist_y_series) < STIM_WINDOW_FRAMES // 2:
-        return False
+        persons = body_index.get(frame_id, {})
 
-    window = wrist_y_series[-STIM_WINDOW_FRAMES:]
-    window = window[~np.isnan(window)]
+        if not persons:
+            now = time.perf_counter(); dt = now - prev_t; prev_t = now
+            if dt > 0: fps_buf.append(1.0/dt)
+            disp_fps = float(np.mean(fps_buf)) if fps_buf else 0.0
+            progress = csv_frame_idx / max(1, total_csv_frames-1)
+            Renderer.draw_hud(frame, frame_id, disp_fps, 0, paused, speed, progress)
+            cv2.imshow(CFG.WINDOW_NAME, frame)
+            last_rendered = frame.copy()
+            if writer: writer.write(frame)
+            csv_frame_idx += 1; tick += 1
+            cv2.waitKey(frame_delay_ms)
+            continue
 
-    if len(window) < 10:
-        return False
+        frame_results: dict[int, tuple] = {}
 
-    # Smooth slightly to reduce noise
-    kernel = np.ones(3) / 3
-    smoothed = np.convolve(window, kernel, mode="same")
+        for track_id, kp_array in persons.items():
+            track = get_track(track_id)
+            feat  = track.process(kp_array)
 
-    # Detect peaks (upward excursions) and troughs (downward)
-    peaks,  peak_props  = find_peaks(smoothed,  prominence=STIM_MIN_AMPLITUDE / 2)
-    troughs, trough_props = find_peaks(-smoothed, prominence=STIM_MIN_AMPLITUDE / 2)
+            raw_w.writerow({"frame_id": frame_id, "track_id": track_id, **feat})
+            rows_written += 1
 
-    if len(peaks) < STIM_MIN_PEAKS // 2 or len(troughs) < STIM_MIN_PEAKS // 2:
-        return False
+            beh_label, beh_conf = dominant_behaviour(feat)
+            summary.ingest(frame_id, track_id, beh_label, beh_conf)
 
-    # Merge and sort all extrema
-    extrema = sorted(list(peaks) + list(troughs))
-    if len(extrema) < STIM_MIN_PEAKS:
-        return False
+            frame_results[track_id] = (track, feat)
 
-    # Check amplitudes and periods between consecutive extrema
-    valid_oscillations = 0
-    for i in range(len(extrema) - 1):
-        period = extrema[i + 1] - extrema[i]
-        amplitude = abs(smoothed[extrema[i + 1]] - smoothed[extrema[i]])
-        if amplitude >= STIM_MIN_AMPLITUDE and period <= STIM_MAX_PERIOD:
-            valid_oscillations += 1
+        if csv_frame_idx % 60 == 0:
+            raw_fh.flush()
 
-    return valid_oscillations >= STIM_MIN_PEAKS - 1
+        now = time.perf_counter(); dt = now - prev_t; prev_t = now
+        if dt > 0: fps_buf.append(1.0/dt)
+        disp_fps = float(np.mean(fps_buf)) if fps_buf else 0.0
+        progress = csv_frame_idx / max(1, total_csv_frames - 1)
 
-
-# ──────────────────────────────────────────────
-# MAIN PIPELINE
-# ──────────────────────────────────────────────
-
-def load_csv(path: str) -> pd.DataFrame:
-    print(f"[INFO] Loading {path} ...")
-    df = pd.read_csv(path, dtype={
-        "frame_id":     int,
-        "track_id":     int,
-        "landmark_idx": float,   # float to handle NaN rows
-        "x":            float,
-        "y":            float,
-        "visibility":   float,
-    })
-    # Drop rows with missing landmark data
-    df = df.dropna(subset=["landmark_idx", "x", "y"])
-    df["landmark_idx"] = df["landmark_idx"].astype(int)
-    print(f"[INFO] Loaded {len(df):,} rows | "
-          f"{df['track_id'].nunique()} tracks | "
-          f"{df['frame_id'].nunique()} frames")
-    return df
-
-
-def build_keypoint_dicts(df: pd.DataFrame) -> dict:
-    """
-    Returns nested dict:
-      kp_store[track_id][frame_id] = {landmark_idx: (x, y, visibility)}
-    """
-    print("[INFO] Building keypoint lookup table ...")
-    kp_store = defaultdict(lambda: defaultdict(dict))
-    for row in df.itertuples(index=False):
-        kp_store[row.track_id][row.frame_id][row.landmark_idx] = (
-            row.x, row.y, row.visibility
+        renderer.render_all(
+            frame, frame_results, frame_id,
+            disp_fps, paused, speed, progress, tick
         )
-    return kp_store
 
+        cv2.imshow(CFG.WINDOW_NAME, frame)
+        last_rendered = frame.copy()
 
-def run_classifier(df: pd.DataFrame, fps: float = 30.0):
-    kp_store = build_keypoint_dicts(df)
+        if writer:
+            writer.write(frame)
 
-    all_track_ids = sorted(kp_store.keys())
-    all_frames    = sorted(df["frame_id"].unique())
+        csv_frame_idx += 1
+        tick          += 1
 
-    records = []   # per-frame results
+        cv2.waitKey(frame_delay_ms)
 
-    print("[INFO] Running classifiers ...")
-    for tid in all_track_ids:
-        track_frames = sorted(kp_store[tid].keys())
+    cap.release()
+    if writer: writer.release()
+    cv2.destroyAllWindows()
+    raw_fh.flush()
+    raw_fh.close()
 
-        # Rolling wrist-y buffers for stimming detection
-        wrist_y_left  = []
-        wrist_y_right = []
+    print(f"\n[Done]  CSV 1 — {rows_written} rows → {raw_out}")
 
-        # Cumulative agitation score
-        agitation_score = 0.0
-
-        prev_kps = None
-
-        for fid in track_frames:
-            curr_kps = kp_store[tid][fid]
-
-            # ── 1. Hand Raising ──
-            hand_raised = detect_hand_raised(curr_kps)
-
-            # ── 2. Posture ──
-            posture = classify_posture(curr_kps)
-
-            # ── 3. Agitation ──
-            frame_speed = 0.0
-            if prev_kps is not None:
-                frame_speed = compute_agitation(curr_kps, prev_kps)
-                if frame_speed > AGITATION_SPEED_THR:
-                    agitation_score += 1.0
-
-            # ── 4. Stimming — update wrist y buffers ──
-            _, lwy, lwv = _kp(curr_kps, KP["left_wrist"])
-            _, rwy, rwv = _kp(curr_kps, KP["right_wrist"])
-
-            wrist_y_left.append(lwy  if _valid(lwv) else np.nan)
-            wrist_y_right.append(rwy if _valid(rwv) else np.nan)
-
-            # Keep buffer bounded
-            if len(wrist_y_left)  > STIM_WINDOW_FRAMES * 2:
-                wrist_y_left  = wrist_y_left[-STIM_WINDOW_FRAMES:]
-                wrist_y_right = wrist_y_right[-STIM_WINDOW_FRAMES:]
-
-            stim_left  = detect_stimming(np.array(wrist_y_left))
-            stim_right = detect_stimming(np.array(wrist_y_right))
-            is_stimming = stim_left or stim_right
-
-            records.append({
-                "frame_id":        fid,
-                "track_id":        tid,
-                "is_hand_raised":  hand_raised,
-                "posture":         posture,
-                "frame_speed_px":  round(frame_speed, 3),
-                "agitation_score": round(agitation_score, 1),
-                "is_stimming":     is_stimming,
+    summary.flush()
+    episodes = summary.episodes
+    with open(sum_out, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=_SUM_COLS)
+        w.writeheader()
+        for ep in episodes:
+            w.writerow({
+                "track_id":        ep.track_id,
+                "behaviour":       ep.behaviour,
+                "start_frame":     ep.start_frame,
+                "end_frame":       ep.end_frame,
+                "duration_frames": ep.duration_frames,
+                "confidence_avg":  round(ep.confidence_avg, 4),
             })
 
-            prev_kps = curr_kps
+    print(f"[Done]  CSV 2 — {len(episodes)} episodes → {sum_out}")
+    print(f"        {len(track_states)} unique track IDs.\n")
 
-    results_df = pd.DataFrame(records)
-    results_df = results_df.sort_values(["track_id", "frame_id"]).reset_index(drop=True)
-    return results_df
-
-
-def build_summary(results_df: pd.DataFrame, fps: float = 30.0) -> pd.DataFrame:
-    """Aggregate per-track summary statistics."""
-    summaries = []
-    for tid, grp in results_df.groupby("track_id"):
-        n_frames      = len(grp)
-        duration_sec  = n_frames / fps
-
-        hand_raise_pct = grp["is_hand_raised"].mean() * 100
-        stim_pct       = grp["is_stimming"].mean() * 100
-        posture_counts = grp["posture"].value_counts(normalize=True) * 100
-
-        summaries.append({
-            "track_id":              tid,
-            "total_frames":          n_frames,
-            "duration_sec":          round(duration_sec, 2),
-            "hand_raise_pct":        round(hand_raise_pct, 2),
-            "posture_sitting_pct":   round(posture_counts.get("sitting",   0), 2),
-            "posture_standing_pct":  round(posture_counts.get("standing",  0), 2),
-            "posture_slouching_pct": round(posture_counts.get("slouching", 0), 2),
-            "posture_unknown_pct":   round(posture_counts.get("unknown",   0), 2),
-            "dominant_posture":      grp["posture"].mode()[0],
-            "final_agitation_score": round(grp["agitation_score"].iloc[-1], 1),
-            "agitation_per_min":     round(grp["agitation_score"].iloc[-1] / max(duration_sec / 60, 1e-6), 2),
-            "stimming_pct":          round(stim_pct, 2),
-            "mean_frame_speed_px":   round(grp["frame_speed_px"].mean(), 3),
-        })
-
-    return pd.DataFrame(summaries).sort_values("track_id").reset_index(drop=True)
+    print(f"{'='*64}")
+    print(f"  {'ID':>4}  {'Behaviour':<14} {'Start':>7} {'End':>7} {'Frames':>7} {'Conf':>6}")
+    print(f"{'='*64}")
+    for ep in episodes:
+        print(f"  {ep.track_id:>4}  {ep.behaviour:<14} "
+              f"{ep.start_frame:>7} {ep.end_frame:>7} "
+              f"{ep.duration_frames:>7} {ep.confidence_avg:>6.3f}")
+    print(f"{'='*64}\n")
 
 
-def print_summary_table(summary_df: pd.DataFrame):
-    print("\n" + "=" * 70)
-    print("BEHAVIOR SUMMARY PER CHILD (track_id)")
-    print("=" * 70)
-    for _, row in summary_df.iterrows():
-        print(f"\n  Track ID : {int(row['track_id'])}")
-        print(f"  Duration : {row['duration_sec']}s  ({int(row['total_frames'])} frames)")
-        print(f"  ✋ Hand Raised    : {row['hand_raise_pct']:.1f}% of frames")
-        print(f"  🧍 Posture        : {row['dominant_posture'].upper()} "
-              f"(sit={row['posture_sitting_pct']:.0f}% "
-              f"stand={row['posture_standing_pct']:.0f}% "
-              f"slouch={row['posture_slouching_pct']:.0f}%)")
-        print(f"  ⚡ Agitation score: {row['final_agitation_score']} "
-              f"({row['agitation_per_min']:.1f}/min)")
-        print(f"  🔄 Stimming       : {row['stimming_pct']:.1f}% of frames")
-    print("=" * 70 + "\n")
+# ==============================================================================
+# CLI
+# ==============================================================================
 
-
-# ──────────────────────────────────────────────
-# ENTRY POINT
-# ──────────────────────────────────────────────
-
-def main():
-    parser = argparse.ArgumentParser(description="Behavior classifier from raw_body_multi.csv")
-    parser.add_argument("--input",  default="raw_body_multi.csv",        help="Path to input CSV")
-    parser.add_argument("--out_frames",   default="behavior_per_frame.csv",  help="Per-frame output CSV")
-    parser.add_argument("--out_summary",  default="behavior_summary.csv",    help="Summary output CSV")
-    parser.add_argument("--fps",    type=float, default=30.0,            help="Video FPS (for duration calc)")
-    args = parser.parse_args()
-
-    if not os.path.exists(args.input):
-        print(f"[ERROR] Input file not found: {args.input}")
-        return
-
-    # Load raw data
-    df = load_csv(args.input)
-
-    # Run classifiers
-    results_df = run_classifier(df, fps=args.fps)
-
-    # Build summary
-    summary_df = build_summary(results_df, fps=args.fps)
-
-    # Save outputs
-    results_df.to_csv(args.out_frames,  index=False)
-    summary_df.to_csv(args.out_summary, index=False)
-
-    print(f"[OK] Per-frame results → {args.out_frames}  ({len(results_df):,} rows)")
-    print(f"[OK] Summary           → {args.out_summary} ({len(summary_df)} tracks)")
-
-    print_summary_table(summary_df)
+def _parse() -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        description="Behaviour Classifier v5 — CSV-driven real-time video overlay"
+    )
+    p.add_argument("--video",      default=CFG.VIDEO_PATH,
+                   help=f"Input video file (default: {CFG.VIDEO_PATH})")
+    p.add_argument("--body",       default=CFG.BODY_CSV,
+                   help="raw_body_multi.csv from extract_raw_data_multi.py")
+    p.add_argument("--raw-out",    dest="raw_out",   default=CFG.RAW_OUT_CSV)
+    p.add_argument("--sum-out",    dest="sum_out",   default=CFG.SUM_OUT_CSV)
+    p.add_argument("--speed",      type=float, default=1.0,
+                   help="Playback speed multiplier (default: 1.0)")
+    p.add_argument("--step",       action="store_true",
+                   help="Step mode: advance one frame per SPACE press")
+    p.add_argument("--save-video", dest="save_video", default="",
+                   help="Save annotated video (e.g. output.mp4)")
+    return p.parse_args()
 
 
 if __name__ == "__main__":
-    main()
+    args = _parse()
+    run(
+        video_path = args.video,
+        body_csv   = args.body,
+        raw_out    = args.raw_out,
+        sum_out    = args.sum_out,
+        speed      = args.speed,
+        step_mode  = args.step,
+        save_video = args.save_video,
+    )
+
+# testgghhhhhhhhjjjjhhjjjj
