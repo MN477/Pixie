@@ -1,75 +1,37 @@
-"""
+"""  
 =============================================================================
-behaviour_classifier_visual.py  —  v5
+body_gestures_labeling_hybrid.py  —  v5 (Headless)
 =============================================================================
 WHAT THIS SCRIPT DOES
 ---------------------
 1. Reads raw_body_multi.csv (produced by extract_raw_data_multi.py).
    This CSV contains one row per keypoint per person per frame:
-       frame_id | track_id | landmark_idx | x | y | visibility
+       frame_id | track_id | landmark_idx | x | y | visibility | bbox_x1..y2
 
-2. Groups all rows by frame_id, rebuilds a (17, 3) keypoint array for
+2. Optionally reads labeled_head_pose_multi.csv for head pitch data.
+
+3. Groups all rows by frame_id, rebuilds a (17, 3) keypoint array for
    each (frame_id, track_id) pair.
 
-3. For each frame_id, seeks the video to that exact frame using
-   cap.set(CAP_PROP_POS_FRAMES, frame_id) so CSV and video are
-   always in perfect sync — regardless of FRAME_STRIDE used during extraction.
-
-4. Runs the 5-behaviour pipeline on the keypoints from the CSV:
+4. Runs the hybrid 5-behaviour pipeline on the keypoints:
        sitting | slouching | standing | bounding | hand_raised
+   Uses knee-angle detection when lower body is visible, and falls
+   back to upper-body metrics (bbox aspect ratio, shoulder position,
+   torso compression, head pitch) when knees are occluded.
 
-5. Draws the results onto the video frame and displays in an OpenCV window.
-
-6. Writes two output CSVs:
+5. Writes two output CSVs:
        behaviour_raw_frames.csv  — one row per (frame, person)
        behaviour_summary.csv     — one row per behaviour episode
 
-CHANGES IN v5
--------------
-- "bouncing" behaviour renamed to "bounding" (large body displacement / jumping detection)
-- BoundingDetector: replaces FFT-based oscillation with displacement-based detection.
-  Triggers when a person's hip centroid moves > BOUND_DISP_NORM * shoulder_width
-  in a single frame (vertical or diagonal leap), confirmed over multiple frames.
-- Improved PostureClassifier:
-    * Hysteresis added to sitting ↔ standing transitions (avoids flicker at threshold)
-    * Separate left/right knee logic — only one side needed for sitting detection
-    * Visibility-weighted averaging of left/right knee angles
-    * Better confidence scaling
-- Improved SlouchDetector:
-    * Added hip-shoulder vertical offset check (hunching forward)
-    * Nose/shoulder ratio measured more robustly
-- Improved HandRaiseSM:
-    * Smoothed wrist position used for geometry check
-    * Added elbow-above-shoulder as a stronger sub-condition
-    * Stricter lowering hysteresis to prevent false resets
-- KeypointBuffer:
-    * Increased KP_INTERP_MAX to 10 frames for better occlusion handling
-    * Kalman R reduced slightly for tighter tracking
-- Display: "bounding" shown in bright cyan
-
-CONTROLS
---------
-  SPACE      pause / resume  (or advance one frame when paused)
-  Q / ESC    quit
-  S          save current frame as PNG snapshot
-  + / -      increase / decrease playback speed
-
 USAGE
 -----
-  python behaviour_classifier_v5.py \
-      --video mardi.mov \
-      --body  raw_body_multi.csv
-
-  # Step through frame by frame (useful for debugging):
-  python behaviour_classifier_v5.py --video mardi.mov --body raw_body_multi.csv --step
-
-  # Save annotated video:
-  python behaviour_classifier_v5.py --video mardi.mov --body raw_body_multi.csv \
-      --save-video output_annotated.mp4
+  python body_gestures_labeling_hybrid.py
+  python body_gestures_labeling_hybrid.py --body raw_body_multi.csv
+  python body_gestures_labeling_hybrid.py --head-pose labeled_head_pose_multi.csv
 
 DEPENDENCIES
 ------------
-  pip install numpy pandas opencv-python
+  pip install numpy pandas
 =============================================================================
 """
 
@@ -78,6 +40,7 @@ from __future__ import annotations
 import argparse
 import csv
 import math
+import os
 import sys
 import time
 from collections import defaultdict, deque
@@ -85,7 +48,6 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
-import cv2
 import numpy as np
 import pandas as pd
 
@@ -120,28 +82,27 @@ N_KP              = 17
 
 class CFG:
     # I/O (overridden by CLI)
-    VIDEO_PATH:  str = "sarra2.mov"
     BODY_CSV:    str = "raw_body_multi.csv"
     RAW_OUT_CSV: str = "behaviour_raw_frames.csv"
     SUM_OUT_CSV: str = "behaviour_summary.csv"
 
     # Keypoint confidence gate
-    KP_CONF_MIN:   float = 0.25          # lowered from 0.30 for more detections
-    KP_INTERP_MAX: int   = 10            # increased: extrapolate up to 10 missing frames
+    KP_CONF_MIN:   float = 0.25
+    KP_INTERP_MAX: int   = 10
 
     # Kalman filter noise
-    KP_KALMAN_Q: float = 2e-4            # slightly reduced → smoother tracks
-    KP_KALMAN_R: float = 6e-3            # slightly tighter measurement trust
+    KP_KALMAN_Q: float = 2e-4
+    KP_KALMAN_R: float = 6e-3
 
     # Body ruler fallback when both shoulders invisible
     FALLBACK_SW: float = 100.0
 
     # ── Behaviour 1 & 3 : Sitting / Standing (with hysteresis) ────────────
-    SITTING_KNEE_ANGLE_MAX:   float = 140.0   # enter sitting if avg < this
-    SITTING_KNEE_ANGLE_EXIT:  float = 150.0   # leave sitting if avg > this (hysteresis)
-    STANDING_KNEE_ANGLE_MIN:  float = 158.0   # enter standing if avg > this
-    STANDING_KNEE_ANGLE_EXIT: float = 148.0   # leave standing if avg < this (hysteresis)
-    POSTURE_CONFIRM_FRAMES:   int   = 4        # frames a posture must hold before switching
+    SITTING_KNEE_ANGLE_MAX:   float = 140.0
+    SITTING_KNEE_ANGLE_EXIT:  float = 150.0
+    STANDING_KNEE_ANGLE_MIN:  float = 158.0
+    STANDING_KNEE_ANGLE_EXIT: float = 148.0
+    POSTURE_CONFIRM_FRAMES:   int   = 4
 
     # ── Upper-body fallback (desk-occluded lower body) ─────────────────
     KNEE_VIS_MIN: float = 0.30
@@ -153,45 +114,22 @@ class CFG:
     UB_HEAD_PITCH_SLOUCH: float = -18.0
 
     # ── Behaviour 2 : Slouching ────────────────────────────────────────────
-    SLOUCH_SPINE_TILT_MAX:     float = 12.0   # deg from vertical — tighter threshold
-    SLOUCH_NOSE_DROP_NORM:     float = 0.15   # nose drop / shoulder_width
-    SLOUCH_HIP_FORWARD_NORM:   float = 0.10   # hip mid ahead of shoulder mid / sw
+    SLOUCH_SPINE_TILT_MAX:     float = 12.0
+    SLOUCH_NOSE_DROP_NORM:     float = 0.15
+    SLOUCH_HIP_FORWARD_NORM:   float = 0.10
 
-    # ── Behaviour 4 : Bounding (large body displacement — leaping/jumping) ──
-    # Replaces the old FFT-based "bouncing" detector.
-    # Triggers when the hip centroid moves > BOUND_DISP_NORM * sw per frame,
-    # confirmed over BOUND_CONFIRM_FRAMES consecutive frames.
-    BOUND_DISP_NORM:      float = 0.25   # displacement threshold relative to sw
-    BOUND_CONFIRM_FRAMES: int   = 3      # frames needed to confirm bounding
-    BOUND_DECAY_FRAMES:   int   = 8      # frames bounding stays active after last trigger
-    BOUND_HISTORY_LEN:    int   = 5      # rolling window for displacement smoothing
+    # ── Behaviour 4 : Bounding (large body displacement) ──────────────────
+    BOUND_DISP_NORM:      float = 0.25
+    BOUND_CONFIRM_FRAMES: int   = 3
+    BOUND_DECAY_FRAMES:   int   = 8
+    BOUND_HISTORY_LEN:    int   = 5
 
     # ── Behaviour 5 : Hand raise ───────────────────────────────────────────
-    HAND_ABOVE_MARGIN_NORM: float = 0.08   # wrist above shoulder / sw (slightly tighter)
-    ELBOW_ABOVE_SHOULDER:   bool  = True   # require elbow above shoulder midpoint too
-    HAND_VEL_NORM:          float = 0.06   # reduced: upward wrist vel / sw / frame
-    HAND_RAISE_HOLD:        int   = 6      # frames to confirm raise
-    HAND_LOWER_HOLD:        int   = 15     # frames to confirm lower (stronger hysteresis)
-
-    # ── Display ────────────────────────────────────────────────────────────
-    WINDOW_NAME: str = "Behaviour Classifier v5"
-
-    # Behaviour colour map (BGR)
-    BEHAVIOUR_COLORS: dict = {
-        "sitting":     (0,   200, 255),   # amber
-        "standing":    (0,   220,  80),   # green
-        "slouching":   (0,    80, 255),   # red-orange
-        "bounding":    (255, 230,   0),   # bright cyan
-        "hand_raised": (255,   0, 200),   # magenta
-        "unknown":     (140, 140, 140),   # grey
-    }
-
-    # Per-track ID colours for skeleton
-    ID_PALETTE = [
-        (0, 200, 255), (0, 255, 128), (255, 128, 0),
-        (200, 0, 255), (0, 128, 255), (255, 0, 128),
-        (128, 255, 0), (255, 200, 0), (0, 255, 220),
-    ]
+    HAND_ABOVE_MARGIN_NORM: float = 0.08
+    ELBOW_ABOVE_SHOULDER:   bool  = True
+    HAND_VEL_NORM:          float = 0.06
+    HAND_RAISE_HOLD:        int   = 6
+    HAND_LOWER_HOLD:        int   = 15
 
 
 # ==============================================================================
@@ -530,6 +468,24 @@ class PostureClassifier:
                 raw_label = self._state
                 res.confidence = 0.5
 
+        # ── Hysteresis state machine ──────────────────────────────────────
+        if raw_label == self._state:
+            self._hold_counter = 0
+            new_state = self._state
+        else:
+            if raw_label == self._candidate:
+                self._hold_counter += 1
+            else:
+                self._candidate    = raw_label
+                self._hold_counter = 1
+
+            if self._hold_counter >= CFG.POSTURE_CONFIRM_FRAMES:
+                self._state        = raw_label
+                self._hold_counter = 0
+            new_state = self._state
+
+        res.label = new_state
+        return res
 
 # ==============================================================================
 # BEHAVIOUR 4 — BOUNDING DETECTOR
@@ -814,16 +770,18 @@ def dominant_behaviour(feat: dict) -> tuple[str, float]:
 # CSV LOADER — reads raw_body_multi.csv into a frame-indexed structure
 # ==============================================================================
 
-def load_body_csv(body_csv: str) -> tuple[dict[int, dict[int, np.ndarray]], list[int]]:
+def load_body_csv(body_csv: str) -> tuple[dict[int, dict[int, np.ndarray]], dict[int, dict[int, tuple]], list[int]]:
     """
     Reads raw_body_multi.csv (long format: 17 rows per person per frame).
     Returns:
         body_index  : {frame_id: {track_id: np.ndarray(17, 3)}}
+        bbox_index  : {frame_id: {track_id: (x1, y1, x2, y2)}}
         frame_ids   : sorted list of all unique frame_ids in the CSV
     """
     print(f"[CSV]   Loading {body_csv}", end="", flush=True)
 
     body_index: dict[int, dict[int, np.ndarray]] = defaultdict(dict)
+    bbox_index: dict[int, dict[int, tuple]] = defaultdict(dict)
     chunk_size  = 17 * 20 * 500
 
     for chunk in pd.read_csv(
@@ -835,6 +793,10 @@ def load_body_csv(body_csv: str) -> tuple[dict[int, dict[int, np.ndarray]], list
             "x":             float,
             "y":             float,
             "visibility":    float,
+            "bbox_x1":       float,
+            "bbox_y1":       float,
+            "bbox_x2":       float,
+            "bbox_y2":       float,
         },
         chunksize=chunk_size,
     ):
@@ -844,6 +806,16 @@ def load_body_csv(body_csv: str) -> tuple[dict[int, dict[int, np.ndarray]], list
         for (fid, tid), grp in chunk.groupby(["frame_id", "track_id"]):
             fid = int(fid); tid = int(tid)
             arr = np.zeros((N_KP, 3), dtype=np.float64)
+
+            # Bbox
+            bx1 = grp["bbox_x1"].iloc[0]
+            if not pd.isna(bx1):
+                bbox_index[fid][tid] = (
+                    float(bx1),
+                    float(grp["bbox_y1"].iloc[0]),
+                    float(grp["bbox_x2"].iloc[0]),
+                    float(grp["bbox_y2"].iloc[0])
+                )
 
             for _, row in grp.iterrows():
                 idx = int(row["landmark_idx"])
@@ -863,270 +835,8 @@ def load_body_csv(body_csv: str) -> tuple[dict[int, dict[int, np.ndarray]], list
     frame_ids = sorted(body_index.keys())
     print(f"\n[CSV]   {len(frame_ids)} frames loaded, "
           f"frame range [{frame_ids[0]} … {frame_ids[-1]}]")
-    return body_index, frame_ids
+    return body_index, bbox_index, frame_ids
 
-
-# ==============================================================================
-# OVERLAY RENDERER
-# ==============================================================================
-
-class Renderer:
-    FONT      = cv2.FONT_HERSHEY_SIMPLEX
-    FONT_BOLD = cv2.FONT_HERSHEY_DUPLEX
-
-    _LINKS = [
-        (KP_LEFT_SHOULDER,  KP_LEFT_ELBOW,    None, 2),
-        (KP_LEFT_ELBOW,     KP_LEFT_WRIST,    None, 2),
-        (KP_RIGHT_SHOULDER, KP_RIGHT_ELBOW,   None, 2),
-        (KP_RIGHT_ELBOW,    KP_RIGHT_WRIST,   None, 2),
-        (KP_LEFT_SHOULDER,  KP_RIGHT_SHOULDER,(170,170,170), 2),
-        (KP_LEFT_SHOULDER,  KP_LEFT_HIP,      (170,170,170), 2),
-        (KP_RIGHT_SHOULDER, KP_RIGHT_HIP,     (170,170,170), 2),
-        (KP_LEFT_HIP,       KP_RIGHT_HIP,     (170,170,170), 2),
-        (KP_LEFT_HIP,       KP_LEFT_KNEE,     (100,160,220), 2),
-        (KP_LEFT_KNEE,      KP_LEFT_ANKLE,    (100,160,220), 2),
-        (KP_RIGHT_HIP,      KP_RIGHT_KNEE,    (100,160,220), 2),
-        (KP_RIGHT_KNEE,     KP_RIGHT_ANKLE,   (100,160,220), 2),
-    ]
-    _ARM_INDICES = {
-        KP_LEFT_SHOULDER, KP_LEFT_ELBOW, KP_LEFT_WRIST,
-        KP_RIGHT_SHOULDER, KP_RIGHT_ELBOW, KP_RIGHT_WRIST,
-    }
-
-    @staticmethod
-    def _beh_col(beh: str) -> tuple:
-        return CFG.BEHAVIOUR_COLORS.get(beh, CFG.BEHAVIOUR_COLORS["unknown"])
-
-    @classmethod
-    def draw_skeleton(
-        cls,
-        frame:      np.ndarray,
-        kpb:        KeypointBuffer,
-        beh:        str,
-        hand_raised: bool,
-        is_bounding: bool,
-    ) -> tuple[int, int, int, int]:
-        beh_col  = cls._beh_col(beh)
-        arm_col  = (0, 255, 0) if hand_raised else beh_col
-        # Flash skeleton bright yellow when bounding
-        if is_bounding:
-            beh_col = (0, 230, 255)
-        xs, ys   = [], []
-
-        def _pt(idx: int) -> Optional[tuple[int, int]]:
-            p = kpb.get(idx)
-            if p:
-                xs.append(int(p[0])); ys.append(int(p[1]))
-                return int(p[0]), int(p[1])
-            return None
-
-        for a_idx, b_idx, fixed_col, thick in cls._LINKS:
-            col = arm_col if a_idx in cls._ARM_INDICES else (fixed_col or beh_col)
-            pa  = _pt(a_idx); pb = _pt(b_idx)
-            if pa and pb:
-                cv2.line(frame, pa, pb, col, thick, cv2.LINE_AA)
-
-        for idx in range(N_KP):
-            pt = _pt(idx)
-            if pt:
-                is_wrist = idx in (KP_LEFT_WRIST, KP_RIGHT_WRIST)
-                dot_col  = (0, 255, 0) if (hand_raised and is_wrist) else beh_col
-                r        = 5 if is_wrist else 3
-                cv2.circle(frame, pt, r, dot_col, -1, cv2.LINE_AA)
-
-        return (min(xs), min(ys), max(xs), max(ys)) if xs else (0, 0, 0, 0)
-
-    @classmethod
-    def draw_badge(
-        cls,
-        frame: np.ndarray,
-        tid:   int,
-        beh:   str,
-        conf:  float,
-        cx:    int,
-        top_y: int,
-    ) -> None:
-        label = f"ID:{tid}  {beh.upper().replace('_',' ')}  {int(conf*100)}%"
-        fs    = 0.50
-        (tw, th), _ = cv2.getTextSize(label, cls.FONT_BOLD, fs, 1)
-
-        pad_x, pad_y = 10, 5
-        bx1 = max(0, cx - tw//2 - pad_x)
-        bx2 = bx1 + tw + pad_x * 2
-        by1 = max(0, top_y - th - pad_y*2 - 6)
-        by2 = top_y - 6
-
-        if by2 <= by1:
-            by1 = max(0, by2 - th - pad_y*2)
-
-        beh_col = cls._beh_col(beh)
-        cv2.rectangle(frame, (bx1, by1), (bx2, by2), beh_col, cv2.FILLED)
-        cv2.rectangle(frame, (bx1, by1), (bx2, by2), (20, 20, 20), 1)
-        cv2.putText(frame, label, (bx1 + pad_x, by1 + pad_y + th),
-                    cls.FONT_BOLD, fs, (0, 0, 0), 1, cv2.LINE_AA)
-
-        bw     = bx2 - bx1
-        filled = max(0, min(bw, int(bw * conf)))
-        cv2.rectangle(frame, (bx1, by2),           (bx2,         by2+4), (40,40,40),  cv2.FILLED)
-        cv2.rectangle(frame, (bx1, by2),           (bx1+filled,  by2+4), beh_col,     cv2.FILLED)
-
-    @classmethod
-    def draw_diagnostics(
-        cls,
-        frame:   np.ndarray,
-        feat:    dict,
-        x_right: int,
-        y_top:   int,
-    ) -> None:
-        def _s(key: str) -> str:
-            v = feat.get(key, "")
-            if v == "" or (isinstance(v, float) and math.isnan(v)):
-                return "n/a"
-            return str(v) if isinstance(v, str) else f"{float(v):.1f}"
-
-        lines = [
-            f"knee : {_s('avg_knee_angle')}",
-            f"spine: {_s('spine_tilt_deg')}",
-            f"nose : {_s('nose_drop_norm')}",
-            f"hip_f: {_s('hip_forward_norm')}",
-            f"disp : {_s('disp_score')}",
-            f"W>sh : {feat.get('wrist_above_shoulder',0)}",
-            f"E>sh : {feat.get('elbow_above_shoulder',0)}",
-            f"W>vel: {feat.get('wrist_vel_up',0)}",
-        ]
-        lh = 14; pw = 130; ph = lh*len(lines)+6
-        px1 = min(x_right+4, frame.shape[1]-pw-2)
-        py1 = max(0, y_top)
-        px2 = min(frame.shape[1]-1, px1+pw)
-        py2 = min(frame.shape[0]-1, py1+ph)
-
-        sub = frame[py1:py2, px1:px2]
-        if sub.size > 0:
-            frame[py1:py2, px1:px2] = cv2.addWeighted(sub, 0.25,
-                                                        np.zeros_like(sub), 0.75, 0)
-        for i, line in enumerate(lines):
-            ty = py1 + lh*(i+1)
-            if ty < frame.shape[0]:
-                cv2.putText(frame, line, (px1+3, ty),
-                            cls.FONT, 0.36, (200,200,200), 1, cv2.LINE_AA)
-
-    @classmethod
-    def draw_hand_banner(
-        cls,
-        frame:  np.ndarray,
-        tid:    int,
-        cx:     int,
-        top_y:  int,
-        tick:   int,
-    ) -> None:
-        if (tick // 15) % 2 == 0:
-            label = f"! HAND RAISED  ID:{tid} !"
-            fs    = 0.52
-            (tw, th), _ = cv2.getTextSize(label, cls.FONT_BOLD, fs, 2)
-            bx1 = max(0, cx - tw//2 - 8)
-            by1 = max(0, top_y - th - 44)
-            bx2 = bx1 + tw + 16
-            by2 = by1 + th + 10
-            cv2.rectangle(frame, (bx1, by1), (bx2, by2), (220, 0, 200), cv2.FILLED)
-            cv2.putText(frame, label, (bx1+8, by1+th+4),
-                        cls.FONT_BOLD, fs, (255,255,255), 2, cv2.LINE_AA)
-
-    @classmethod
-    def draw_bounding_banner(
-        cls,
-        frame:  np.ndarray,
-        tid:    int,
-        cx:     int,
-        top_y:  int,
-        tick:   int,
-    ) -> None:
-        """Animated BOUNDING banner shown when large displacement detected."""
-        if (tick // 10) % 2 == 0:
-            label = f">> BOUNDING  ID:{tid} <<"
-            fs    = 0.52
-            (tw, th), _ = cv2.getTextSize(label, cls.FONT_BOLD, fs, 2)
-            bx1 = max(0, cx - tw//2 - 8)
-            by1 = max(0, top_y - th - 60)
-            bx2 = bx1 + tw + 16
-            by2 = by1 + th + 10
-            cv2.rectangle(frame, (bx1, by1), (bx2, by2), (0, 200, 255), cv2.FILLED)
-            cv2.putText(frame, label, (bx1+8, by1+th+4),
-                        cls.FONT_BOLD, fs, (0, 0, 0), 2, cv2.LINE_AA)
-
-    @staticmethod
-    def draw_hud(
-        frame:     np.ndarray,
-        frame_id:  int,
-        fps:       float,
-        n_persons: int,
-        paused:    bool,
-        speed:     float,
-        progress:  float,
-    ) -> None:
-        h, w = frame.shape[:2]
-
-        hud_lines = [
-            f"Frame : {frame_id}",
-            f"FPS   : {fps:.1f}",
-            f"People: {n_persons}",
-            f"Speed : {speed:.1f}x",
-            "|| PAUSED" if paused else "> PLAYING",
-        ]
-        hud_h, hud_w = 18*len(hud_lines)+8, 155
-        sub = frame[0:hud_h, 0:hud_w]
-        if sub.size > 0:
-            frame[0:hud_h, 0:hud_w] = cv2.addWeighted(sub, 0.2,
-                                                        np.zeros_like(sub), 0.8, 0)
-        for i, line in enumerate(hud_lines):
-            col = (0, 60, 255) if "PAUSED" in line else (0, 255, 180)
-            cv2.putText(frame, line, (6, 18+i*18),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.47, col, 1, cv2.LINE_AA)
-
-        bar_h  = 6
-        filled = int(w * progress)
-        cv2.rectangle(frame, (0, h-bar_h), (w, h),       (40,40,40),   cv2.FILLED)
-        cv2.rectangle(frame, (0, h-bar_h), (filled, h),  (0,200,255),  cv2.FILLED)
-
-        hint = "SPACE=pause/step  Q=quit  S=snapshot  +/-=speed"
-        (hw, hh), _ = cv2.getTextSize(hint, cv2.FONT_HERSHEY_SIMPLEX, 0.37, 1)
-        cv2.putText(frame, hint, (w-hw-6, h-bar_h-5),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.37, (150,150,150), 1, cv2.LINE_AA)
-
-    @classmethod
-    def render_all(
-        cls,
-        frame:    np.ndarray,
-        results:  dict,
-        frame_id: int,
-        fps:      float,
-        paused:   bool,
-        speed:    float,
-        progress: float,
-        tick:     int,
-    ) -> None:
-        for tid, (track, feat) in results.items():
-            beh, conf   = dominant_behaviour(feat)
-            hand_up     = bool(feat["hand_raised"])
-            is_bounding = bool(feat["bounding"])
-
-            x_min, y_min, x_max, y_max = cls.draw_skeleton(
-                frame, track.kpb, beh, hand_up, is_bounding
-            )
-
-            if x_max == 0 and y_max == 0:
-                continue
-
-            cx = (x_min + x_max) // 2
-            cls.draw_badge(frame, tid, beh, conf, cx, y_min)
-
-            if hand_up:
-                cls.draw_hand_banner(frame, tid, cx, y_min, tick)
-            if is_bounding:
-                cls.draw_bounding_banner(frame, tid, cx, y_min, tick)
-
-            cls.draw_diagnostics(frame, feat, x_max, y_min)
-
-        cls.draw_hud(frame, frame_id, fps, len(results), paused, speed, progress)
 
 
 # ==============================================================================
@@ -1135,8 +845,10 @@ class Renderer:
 
 _RAW_COLS = [
     "frame_id", "track_id", "shoulder_width_px",
+    "detection_mode",
     "knee_angle_left", "knee_angle_right", "avg_knee_angle",
     "spine_tilt_deg",  "nose_drop_norm",   "hip_forward_norm",
+    "bbox_aspect_ratio", "shoulder_y_norm", "torso_compress", "head_pitch_used",
     "disp_score",
     "wrist_above_shoulder", "elbow_above_shoulder", "wrist_vel_up",
     "posture", "posture_confidence",
@@ -1148,31 +860,56 @@ _SUM_COLS = [
     "start_frame", "end_frame", "duration_frames", "confidence_avg",
 ]
 
+# ==============================================================================
+# HEAD_POSE LOADER
+# ==============================================================================
+
+
+def load_head_pose_csv(head_pose_csv: str) -> dict:
+    hp_index = {}
+    if not os.path.exists(head_pose_csv):
+        return hp_index
+
+    df = pd.read_csv(head_pose_csv)
+    if "pitch_smooth" not in df.columns:
+        return hp_index
+        
+
+    for _, row in df.iterrows():
+        try:
+            fid = int(row["frame_id"])
+            tid = int(row["track_id"])
+            if fid not in hp_index:
+                hp_index[fid] = {}
+            if not math.isnan(row["pitch_smooth"]):
+                hp_index[fid][tid] = float(row["pitch_smooth"])
+        except ValueError:
+            pass
+    return hp_index
+
 
 # ==============================================================================
 # MAIN
 # ==============================================================================
 
+
 def run(
-    video_path: str,
     body_csv:   str,
+    hp_csv:     str,
     raw_out:    str,
     sum_out:    str,
-    speed:      float,
-    step_mode:  bool,
-    save_video: str,
 ) -> None:
 
-    for p, name in [(video_path, "Video"), (body_csv, "Body CSV")]:
-        if not Path(p).exists():
-            print(f"[ERROR] {name} not found: {p}")
-            sys.exit(1)
+    if not Path(body_csv).exists():
+        print(f"[ERROR] Body CSV not found: {body_csv}")
+        sys.exit(1)
 
     print(f"\n{'='*60}")
-    print(f"  Behaviour Classifier v5  —  CSV-driven video overlay")
+    print(f"  Behaviour Classifier v5  —  Headless Pipeline (Hybrid)")
     print(f"{'='*60}\n")
 
-    body_index, frame_ids = load_body_csv(body_csv)
+    body_index, bbox_index, frame_ids = load_body_csv(body_csv)
+    head_pose_index = load_head_pose_csv(hp_csv)
 
     if not frame_ids:
         print("[ERROR] Body CSV is empty or has no valid rows.")
@@ -1180,123 +917,34 @@ def run(
 
     total_csv_frames = len(frame_ids)
     print(f"[CSV]   {total_csv_frames} frames will be processed.\n")
-
-    cap = cv2.VideoCapture(video_path)
-    if not cap.isOpened():
-        print(f"[ERROR] Cannot open video: {video_path}")
-        sys.exit(1)
-
-    total_video_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    video_fps          = cap.get(cv2.CAP_PROP_FPS) or 25.0
-    frame_w            = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    frame_h            = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-
-    print(f"[Video] {Path(video_path).name}  "
-          f"{frame_w}x{frame_h}  {video_fps:.1f}fps  {total_video_frames} frames")
-    print(f"[Mode]  Speed={speed}x  Step={step_mode}")
     print(f"[Out]   {raw_out}  |  {sum_out}\n")
-    print("  Controls: SPACE=pause/step  Q/ESC=quit  S=snapshot  +/-=speed\n")
-
-    writer = None
-    if save_video:
-        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-        writer = cv2.VideoWriter(save_video, fourcc, video_fps, (frame_w, frame_h))
-        print(f"[Save]  Annotated video → {save_video}")
 
     raw_fh = open(raw_out, "w", newline="", encoding="utf-8")
     raw_w  = csv.DictWriter(raw_fh, fieldnames=_RAW_COLS)
     raw_w.writeheader()
 
-    track_states: dict[int, TrackState] = {}
+    track_states: dict = {}
     summary   = SummaryBuilder()
-    renderer  = Renderer()
 
     def get_track(tid: int) -> TrackState:
         if tid not in track_states:
             track_states[tid] = TrackState(track_id=tid)
         return track_states[tid]
 
-    fps_buf:  deque = deque(maxlen=30)
-    prev_t    = time.perf_counter()
-
-    paused         = step_mode
-    tick           = 0
     rows_written   = 0
-    snapshot_count = 0
-    frame_delay_ms = max(1, int(1000 / (video_fps * speed)))
 
-    last_rendered: Optional[np.ndarray] = None
-
-    cv2.namedWindow(CFG.WINDOW_NAME, cv2.WINDOW_NORMAL)
-    cv2.resizeWindow(CFG.WINDOW_NAME, min(frame_w, 1400), min(frame_h, 860))
-
-    csv_frame_idx = 0
-
-    while csv_frame_idx < total_csv_frames:
-
-        key = cv2.waitKey(1) & 0xFF
-
-        if key in (ord('q'), 27):
-            print("\n[Info]  User quit.")
-            break
-
-        if key == ord(' '):
-            if not step_mode:
-                paused = not paused
-
-        if key == ord('s'):
-            if last_rendered is not None:
-                snap = f"snapshot_{snapshot_count:04d}.png"
-                cv2.imwrite(snap, last_rendered)
-                print(f"[Snap]  {snap}")
-                snapshot_count += 1
-
-        if key in (ord('+'), ord('=')):
-            speed = min(speed * 1.5, 32.0)
-            frame_delay_ms = max(1, int(1000 / (video_fps * speed)))
-            print(f"[Speed] {speed:.2f}x")
-
-        if key == ord('-'):
-            speed = max(speed / 1.5, 0.05)
-            frame_delay_ms = max(1, int(1000 / (video_fps * speed)))
-            print(f"[Speed] {speed:.2f}x")
-
-        if paused and key != ord(' '):
-            if last_rendered is not None:
-                cv2.imshow(CFG.WINDOW_NAME, last_rendered)
-            cv2.waitKey(30)
-            continue
-
-        frame_id = frame_ids[csv_frame_idx]
-
-        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_id)
-        ret, frame = cap.read()
-
-        if not ret:
-            print(f"[Warn]  Could not read video frame {frame_id} — skipping.")
-            csv_frame_idx += 1
-            continue
-
+    st_time = time.time()
+    for frame_id in frame_ids:
         persons = body_index.get(frame_id, {})
-
         if not persons:
-            now = time.perf_counter(); dt = now - prev_t; prev_t = now
-            if dt > 0: fps_buf.append(1.0/dt)
-            disp_fps = float(np.mean(fps_buf)) if fps_buf else 0.0
-            progress = csv_frame_idx / max(1, total_csv_frames-1)
-            Renderer.draw_hud(frame, frame_id, disp_fps, 0, paused, speed, progress)
-            cv2.imshow(CFG.WINDOW_NAME, frame)
-            last_rendered = frame.copy()
-            if writer: writer.write(frame)
-            csv_frame_idx += 1; tick += 1
-            cv2.waitKey(frame_delay_ms)
             continue
-
-        frame_results: dict[int, tuple] = {}
 
         for track_id, kp_array in persons.items():
             track = get_track(track_id)
-            feat  = track.process(kp_array)
+            bbox = bbox_index.get(frame_id, {}).get(track_id, None)
+            pitch = head_pose_index.get(frame_id, {}).get(track_id, None)
+
+            feat  = track.process(kp_array, bbox=bbox, head_pitch=pitch)
 
             raw_w.writerow({"frame_id": frame_id, "track_id": track_id, **feat})
             rows_written += 1
@@ -1304,35 +952,6 @@ def run(
             beh_label, beh_conf = dominant_behaviour(feat)
             summary.ingest(frame_id, track_id, beh_label, beh_conf)
 
-            frame_results[track_id] = (track, feat)
-
-        if csv_frame_idx % 60 == 0:
-            raw_fh.flush()
-
-        now = time.perf_counter(); dt = now - prev_t; prev_t = now
-        if dt > 0: fps_buf.append(1.0/dt)
-        disp_fps = float(np.mean(fps_buf)) if fps_buf else 0.0
-        progress = csv_frame_idx / max(1, total_csv_frames - 1)
-
-        renderer.render_all(
-            frame, frame_results, frame_id,
-            disp_fps, paused, speed, progress, tick
-        )
-
-        cv2.imshow(CFG.WINDOW_NAME, frame)
-        last_rendered = frame.copy()
-
-        if writer:
-            writer.write(frame)
-
-        csv_frame_idx += 1
-        tick          += 1
-
-        cv2.waitKey(frame_delay_ms)
-
-    cap.release()
-    if writer: writer.release()
-    cv2.destroyAllWindows()
     raw_fh.flush()
     raw_fh.close()
 
@@ -1364,41 +983,33 @@ def run(
               f"{ep.start_frame:>7} {ep.end_frame:>7} "
               f"{ep.duration_frames:>7} {ep.confidence_avg:>6.3f}")
     print(f"{'='*64}\n")
+    print(f"Total processing time: {time.time() - st_time:.2f}s")
 
 
 # ==============================================================================
 # CLI
 # ==============================================================================
 
+
+
 def _parse() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="Behaviour Classifier v5 — CSV-driven real-time video overlay"
+        description="Behaviour Classifier v5 — Headless Hybrid Posture Pipeline"
     )
-    p.add_argument("--video",      default=CFG.VIDEO_PATH,
-                   help=f"Input video file (default: {CFG.VIDEO_PATH})")
     p.add_argument("--body",       default=CFG.BODY_CSV,
                    help="raw_body_multi.csv from extract_raw_data_multi.py")
+    p.add_argument("--head-pose",  default="labeled_head_pose_multi.csv",
+                   help="labeled_head_pose_multi.csv from label_head_pose.py")
     p.add_argument("--raw-out",    dest="raw_out",   default=CFG.RAW_OUT_CSV)
     p.add_argument("--sum-out",    dest="sum_out",   default=CFG.SUM_OUT_CSV)
-    p.add_argument("--speed",      type=float, default=1.0,
-                   help="Playback speed multiplier (default: 1.0)")
-    p.add_argument("--step",       action="store_true",
-                   help="Step mode: advance one frame per SPACE press")
-    p.add_argument("--save-video", dest="save_video", default="",
-                   help="Save annotated video (e.g. output.mp4)")
     return p.parse_args()
 
 
 if __name__ == "__main__":
     args = _parse()
     run(
-        video_path = args.video,
         body_csv   = args.body,
+        hp_csv     = args.head_pose,
         raw_out    = args.raw_out,
         sum_out    = args.sum_out,
-        speed      = args.speed,
-        step_mode  = args.step,
-        save_video = args.save_video,
     )
-
-# testgghhhhhhhhjjjjhhjjjj
