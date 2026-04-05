@@ -47,7 +47,7 @@ from sixdrepnet import SixDRepNet
 # ──────────────────────────────────────────────
 # CONFIGURATION
 # ──────────────────────────────────────────────
-INPUT_SOURCE = "testing_vid/facial_activity 1.mp4"
+INPUT_SOURCE = "testing_vid/on_vid yawing 1.mp4"
 
 BODY_OUTPUT      = "raw_body_multi.csv"
 HEAD_POSE_OUTPUT = "raw_head_pose_multi.csv"
@@ -225,9 +225,9 @@ class OpenFaceWorker:
             pass
 
 
-# ──────────────────────────────────────────────
+#------------------------------
 # OPENFACE CSV MERGING
-# ──────────────────────────────────────────────
+#------------------------------
 def merge_openface_outputs(openface_out_dir, au_csv, gaze_csv):
     """Parse all OpenFace batch output CSVs and merge into two clean CSVs."""
     au_rows = []
@@ -340,7 +340,8 @@ body_writer      = csv.writer(body_csv_file)
 head_pose_writer = csv.writer(head_pose_csv_file)
 
 body_writer.writerow([
-    "frame_id", "track_id", "landmark_idx", "x", "y", "visibility"
+    "frame_id", "track_id", "landmark_idx", "x", "y", "visibility",
+    "bbox_x1", "bbox_y1", "bbox_x2", "bbox_y2"
 ])
 head_pose_writer.writerow([
     "frame_id", "track_id", "pitch", "yaw", "roll"
@@ -464,9 +465,10 @@ def main():
                             f"{kpts[lm_idx, 0]:.4f}",
                             f"{kpts[lm_idx, 1]:.4f}",
                             f"{kpts[lm_idx, 2]:.4f}",
+                            x1, y1, x2, y2
                         ])
                 else:
-                    body_writer.writerow([frame_id, tid, None, None, None, None])
+                    body_writer.writerow([frame_id, tid, None, None, None, None, x1, y1, x2, y2])
 
                 # ── Step 3: Extract body crop for face detection ──
                 cx1, cy1, cx2, cy2 = expand_bbox(
