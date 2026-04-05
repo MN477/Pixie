@@ -20,29 +20,31 @@ import time
 # ──────────────────────────────────────────────
 # CONFIGURATION
 # ──────────────────────────────────────────────
-INPUT_CSV = "raw_head_pose_multi.csv"
-OUTPUT_CSV = "labeled_head_pose_multi.csv"
+from config import Paths, GlobalConfig, HeadPoseConfig
+
+INPUT_CSV = Paths.HEAD_POSE_INPUT_CSV
+OUTPUT_CSV = Paths.HEAD_POSE_OUTPUT_CSV
 
 # Smoothing & Interpolation
-MEDIAN_WINDOW = 5       # Frames to smooth over (e.g., 5 frames = ~0.3s at 15fps) !!!!!!hard coded 
-INTERPOLATE_LIMIT = 3   # Max consecutive missing frames to "guess" (interpolate) !!!!!!hard coded
+MEDIAN_WINDOW = GlobalConfig.MEDIAN_WINDOW
+INTERPOLATE_LIMIT = GlobalConfig.INTERPOLATE_LIMIT
 
 # Hard Thresholds (Degrees)
-PITCH_UP_THRESH =  15.0  # Pitch > this = Looking Up   !!!!!!hard coded
-PITCH_DOWN_THRESH   = -15.0  # Pitch < this = Looking Down     !!!!!!hard coded
+PITCH_UP_THRESH   = HeadPoseConfig.PITCH_UP_THRESH
+PITCH_DOWN_THRESH = HeadPoseConfig.PITCH_DOWN_THRESH
 
-YAW_LEFT_THRESH   =  20.0  # Yaw > this = Turned Left      !!!!!!hard coded
-YAW_RIGHT_THRESH  = -20.0  # Yaw < this = Turned Right      !!!!!!hard coded
+YAW_LEFT_THRESH  = HeadPoseConfig.YAW_LEFT_THRESH
+YAW_RIGHT_THRESH = HeadPoseConfig.YAW_RIGHT_THRESH
 
-ROLL_LEFT_THRESH  =  15.0  # Roll > this = Tilt-Left   !!!!!!hard coded
-ROLL_RIGHT_THRESH = -15.0  # Roll < this = Tilt-Rightb   !!!!!!hard coded
+ROLL_LEFT_THRESH  = HeadPoseConfig.ROLL_LEFT_THRESH
+ROLL_RIGHT_THRESH = HeadPoseConfig.ROLL_RIGHT_THRESH
 
 # OpenFace Reliability Limits
-YAW_RELIABLE_LIMIT   = 35.0
-PITCH_RELIABLE_LIMIT = 20.0
+YAW_RELIABLE_LIMIT   = HeadPoseConfig.YAW_RELIABLE_LIMIT
+PITCH_RELIABLE_LIMIT = HeadPoseConfig.PITCH_RELIABLE_LIMIT
 
 # Margin (Degrees) past threshold required to reach maximum confidence (1.0)
-MARGIN = 10.0           # !!!!!!hard coded
+MARGIN = HeadPoseConfig.MARGIN
 
 
 # ──────────────────────────────────────────────

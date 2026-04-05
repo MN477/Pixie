@@ -24,9 +24,11 @@ import pandas as pd
 # ──────────────────────────────────────────────
 # CONFIGURATION
 # ──────────────────────────────────────────────
-INPUT_CSV     = "raw_gaze_multi.csv"
-HEAD_POSE_CSV = "labeled_head_pose_multi.csv"
-OUTPUT_CSV    = "labeled_gaze_multi.csv"
+from config import Paths, GlobalConfig, GazeConfig
+
+INPUT_CSV     = Paths.GAZE_INPUT_CSV
+HEAD_POSE_CSV = Paths.GAZE_HEAD_POSE_CSV
+OUTPUT_CSV    = Paths.GAZE_OUTPUT_CSV
 
 # Unit conversion — OpenFace gaze is radians, head pose is degrees.
 # This constant is used explicitly in the divergence formula so the
@@ -34,31 +36,31 @@ OUTPUT_CSV    = "labeled_gaze_multi.csv"
 DEG_TO_RAD = math.pi / 180.0
 
 # FPS — set manually, no auto-estimation.  Fallback: 30 FPS.
-FPS = 30
+FPS = GlobalConfig.FPS
 
 # Smoothing & Interpolation
-MEDIAN_WINDOW    = 5   # Frames to smooth over
-INTERPOLATE_LIMIT = 3  # Max consecutive missing frames to interpolate
+MEDIAN_WINDOW    = GlobalConfig.MEDIAN_WINDOW
+INTERPOLATE_LIMIT = GlobalConfig.INTERPOLATE_LIMIT
 
 # OpenFace reliability
-OPENFACE_CONFIDENCE_THRESH = 0.85
+OPENFACE_CONFIDENCE_THRESH = GlobalConfig.OPENFACE_CONFIDENCE_THRESH
 
 # Horizontal gaze thresholds (radians)
-GAZE_H_CENTER_MAX =  0.15   # |x| <= this → Center
-GAZE_H_MARGIN     =  0.15   # margin past threshold for full confidence
+GAZE_H_CENTER_MAX = GazeConfig.GAZE_H_CENTER_MAX
+GAZE_H_MARGIN     = GazeConfig.GAZE_H_MARGIN
 
 # Vertical gaze thresholds (radians)
-GAZE_V_LEVEL_MAX  =  0.12   # |y| <= this → Level
-GAZE_V_MARGIN     =  0.12   # margin past threshold for full confidence
+GAZE_V_LEVEL_MAX  = GazeConfig.GAZE_V_LEVEL_MAX
+GAZE_V_MARGIN     = GazeConfig.GAZE_V_MARGIN
 
 # Gaze stability
-STABILITY_WINDOW  = 15       # frames (~0.5s at 30fps)
+STABILITY_WINDOW  = GazeConfig.STABILITY_WINDOW
 
 # Duration enforcement (seconds) → converted to frames
-GAZE_MIN_DURATION = 0.3      # labels must sustain this long
+GAZE_MIN_DURATION = GazeConfig.GAZE_MIN_DURATION
 
 # Confidence scaling margin
-CONFIDENCE_MARGIN = 0.15     # radians past threshold for max confidence
+CONFIDENCE_MARGIN = GazeConfig.CONFIDENCE_MARGIN
 
 
 # ──────────────────────────────────────────────

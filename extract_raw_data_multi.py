@@ -47,7 +47,7 @@ from sixdrepnet import SixDRepNet
 # ──────────────────────────────────────────────
 # CONFIGURATION
 # ──────────────────────────────────────────────
-INPUT_SOURCE = "testing_vid/on_vid yawing 1.mp4"
+INPUT_SOURCE = "testing_vid/own_vid(gaze direction)1.mp4"
 
 BODY_OUTPUT      = "raw_body_multi.csv"
 HEAD_POSE_OUTPUT = "raw_head_pose_multi.csv"

@@ -26,61 +26,59 @@ import time
 # ──────────────────────────────────────────────
 # CONFIGURATION
 # ──────────────────────────────────────────────
+from config import Paths, GlobalConfig, ActionUnitConfig
 
 # Input / Output
-INPUT_CSV  = "raw_action_units_multi.csv"
-HEAD_POSE_CSV = "labeled_head_pose_multi.csv"
-OUTPUT_CSV = "labeled_action_units_multi.csv"
-EVENTS_CSV = "collective_events.csv"
+INPUT_CSV  = Paths.AU_INPUT_CSV
+HEAD_POSE_CSV = Paths.AU_HEAD_POSE_CSV
+OUTPUT_CSV = Paths.AU_OUTPUT_CSV
+EVENTS_CSV = Paths.AU_EVENTS_CSV
 
 # FPS — set manually, no auto-estimation.  Fallback: 30 FPS.
-FPS = 30
+FPS = GlobalConfig.FPS
 
 # OpenFace confidence threshold
-OPENFACE_CONFIDENCE_THRESH = 0.85
+OPENFACE_CONFIDENCE_THRESH = GlobalConfig.OPENFACE_CONFIDENCE_THRESH
 
 # Median smoothing window (frames)
-MEDIAN_WINDOW = 5
+MEDIAN_WINDOW = GlobalConfig.MEDIAN_WINDOW
 
 # Duration thresholds (seconds) — converted to frames using FPS
-SMILE_MIN_DURATION       = 0.5   # seconds
-FATIGUE_MIN_DURATION     = 2.0   # seconds
-YAWNING_MIN_DURATION     = 0.2   # seconds (lowered from 0.3)
-TALKING_MIN_DURATION     = 0.5   # seconds
+SMILE_MIN_DURATION       = ActionUnitConfig.SMILE_MIN_DURATION
+FATIGUE_MIN_DURATION     = ActionUnitConfig.FATIGUE_MIN_DURATION
+YAWNING_MIN_DURATION     = ActionUnitConfig.YAWNING_MIN_DURATION
+TALKING_MIN_DURATION     = ActionUnitConfig.TALKING_MIN_DURATION
 
 # Collective smile event window (seconds)
-COLLECTIVE_WINDOW_SEC = 5.0
-COLLECTIVE_MIN_TRACKS = 3
+COLLECTIVE_WINDOW_SEC = ActionUnitConfig.COLLECTIVE_WINDOW_SEC
+COLLECTIVE_MIN_TRACKS = ActionUnitConfig.COLLECTIVE_MIN_TRACKS
 
 # Confidence scaling margin (AU intensity units above threshold for max confidence)
-CONFIDENCE_MARGIN = 1.5
+CONFIDENCE_MARGIN = ActionUnitConfig.CONFIDENCE_MARGIN
 
 # ── Genuine Smile ──
-SMILE_AU06_THRESH = 1.0
-SMILE_AU12_THRESH = 1.0
+SMILE_AU06_THRESH = ActionUnitConfig.SMILE_AU06_THRESH
+SMILE_AU12_THRESH = ActionUnitConfig.SMILE_AU12_THRESH
 
 # ── Fatigue ──
-FATIGUE_AU45_ROLLING_THRESH = 0.3   # rolling mean of AU45_r
-FATIGUE_AU05_UPPER_THRESH   = 0.5   # upper lid NOT raised (< this)
-FATIGUE_AU15_THRESH         = 0.5   # lip corner depressor
-FATIGUE_AU01_THRESH         = 1.0   # optional booster
+FATIGUE_AU45_ROLLING_THRESH = ActionUnitConfig.FATIGUE_AU45_ROLLING_THRESH
+FATIGUE_AU05_UPPER_THRESH   = ActionUnitConfig.FATIGUE_AU05_UPPER_THRESH
+FATIGUE_AU15_THRESH         = ActionUnitConfig.FATIGUE_AU15_THRESH
+FATIGUE_AU01_THRESH         = ActionUnitConfig.FATIGUE_AU01_THRESH
 
 # ── Yawning ──
-YAWNING_AU25_THRESH = 1.5    # high intensity jaw drop onset
-YAWNING_AU26_THRESH = 1.5    # high intensity jaw drop
-YAWNING_AU27_THRESH = 1.0    # mouth stretch — high intensity
+YAWNING_AU25_THRESH = ActionUnitConfig.YAWNING_AU25_THRESH
+YAWNING_AU26_THRESH = ActionUnitConfig.YAWNING_AU26_THRESH
+YAWNING_AU27_THRESH = ActionUnitConfig.YAWNING_AU27_THRESH
 
 # ── Talking Flag ──
-TALKING_AU25_THRESH = 0.5    # lips part
-TALKING_AU26_THRESH = 0.5    # jaw drop
+TALKING_AU25_THRESH = ActionUnitConfig.TALKING_AU25_THRESH
+TALKING_AU26_THRESH = ActionUnitConfig.TALKING_AU26_THRESH
 
 # ── Expressiveness Score ──
 # AU25 removed — it activates during speech and inflates the metric
-EXPRESSIVENESS_AUS = [
-    "AU06_r", "AU12_r", "AU04_r", "AU07_r", "AU09_r",
-    "AU10_r", "AU15_r", "AU17_r", "AU20_r", "AU23_r"
-]
-EXPRESSIVENESS_ACTIVITY_THRESH = 1.0   # AU_r must exceed this to count
+EXPRESSIVENESS_AUS = ActionUnitConfig.EXPRESSIVENESS_AUS
+EXPRESSIVENESS_ACTIVITY_THRESH = ActionUnitConfig.EXPRESSIVENESS_ACTIVITY_THRESH
 
 
 # ──────────────────────────────────────────────

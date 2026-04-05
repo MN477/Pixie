@@ -81,55 +81,57 @@ N_KP              = 17
 # ==============================================================================
 
 class CFG:
+    from config import Paths, BodyGesturesConfig
+
     # I/O (overridden by CLI)
-    BODY_CSV:    str = "raw_body_multi.csv"
-    RAW_OUT_CSV: str = "behaviour_raw_frames.csv"
-    SUM_OUT_CSV: str = "behaviour_summary.csv"
+    BODY_CSV:    str = Paths.BODY_CSV
+    RAW_OUT_CSV: str = Paths.BODY_RAW_OUT_CSV
+    SUM_OUT_CSV: str = Paths.BODY_SUM_OUT_CSV
 
     # Keypoint confidence gate
-    KP_CONF_MIN:   float = 0.25
-    KP_INTERP_MAX: int   = 10
+    KP_CONF_MIN:   float = BodyGesturesConfig.KP_CONF_MIN
+    KP_INTERP_MAX: int   = BodyGesturesConfig.KP_INTERP_MAX
 
     # Kalman filter noise
-    KP_KALMAN_Q: float = 2e-4
-    KP_KALMAN_R: float = 6e-3
+    KP_KALMAN_Q: float = BodyGesturesConfig.KP_KALMAN_Q
+    KP_KALMAN_R: float = BodyGesturesConfig.KP_KALMAN_R
 
     # Body ruler fallback when both shoulders invisible
-    FALLBACK_SW: float = 100.0
+    FALLBACK_SW: float = BodyGesturesConfig.FALLBACK_SW
 
     # ── Behaviour 1 & 3 : Sitting / Standing (with hysteresis) ────────────
-    SITTING_KNEE_ANGLE_MAX:   float = 140.0
-    SITTING_KNEE_ANGLE_EXIT:  float = 150.0
-    STANDING_KNEE_ANGLE_MIN:  float = 158.0
-    STANDING_KNEE_ANGLE_EXIT: float = 148.0
-    POSTURE_CONFIRM_FRAMES:   int   = 4
+    SITTING_KNEE_ANGLE_MAX:   float = BodyGesturesConfig.SITTING_KNEE_ANGLE_MAX
+    SITTING_KNEE_ANGLE_EXIT:  float = BodyGesturesConfig.SITTING_KNEE_ANGLE_EXIT
+    STANDING_KNEE_ANGLE_MIN:  float = BodyGesturesConfig.STANDING_KNEE_ANGLE_MIN
+    STANDING_KNEE_ANGLE_EXIT: float = BodyGesturesConfig.STANDING_KNEE_ANGLE_EXIT
+    POSTURE_CONFIRM_FRAMES:   int   = BodyGesturesConfig.POSTURE_CONFIRM_FRAMES
 
     # ── Upper-body fallback (desk-occluded lower body) ─────────────────
-    KNEE_VIS_MIN: float = 0.30
-    UB_BBOX_AR_SITTING_MAX:  float = 1.6
-    UB_BBOX_AR_STANDING_MIN: float = 2.2
-    UB_SHOULDER_Y_SITTING_MIN: float = 0.30
-    UB_SHOULDER_Y_STANDING_MAX: float = 0.22
-    UB_TORSO_COMPRESS_THRESH: float = 0.08
-    UB_HEAD_PITCH_SLOUCH: float = -18.0
+    KNEE_VIS_MIN: float = BodyGesturesConfig.KNEE_VIS_MIN
+    UB_BBOX_AR_SITTING_MAX:  float = BodyGesturesConfig.UB_BBOX_AR_SITTING_MAX
+    UB_BBOX_AR_STANDING_MIN: float = BodyGesturesConfig.UB_BBOX_AR_STANDING_MIN
+    UB_SHOULDER_Y_SITTING_MIN: float = BodyGesturesConfig.UB_SHOULDER_Y_SITTING_MIN
+    UB_SHOULDER_Y_STANDING_MAX: float = BodyGesturesConfig.UB_SHOULDER_Y_STANDING_MAX
+    UB_TORSO_COMPRESS_THRESH: float = BodyGesturesConfig.UB_TORSO_COMPRESS_THRESH
+    UB_HEAD_PITCH_SLOUCH: float = BodyGesturesConfig.UB_HEAD_PITCH_SLOUCH
 
     # ── Behaviour 2 : Slouching ────────────────────────────────────────────
-    SLOUCH_SPINE_TILT_MAX:     float = 12.0
-    SLOUCH_NOSE_DROP_NORM:     float = 0.15
-    SLOUCH_HIP_FORWARD_NORM:   float = 0.10
+    SLOUCH_SPINE_TILT_MAX:     float = BodyGesturesConfig.SLOUCH_SPINE_TILT_MAX
+    SLOUCH_NOSE_DROP_NORM:     float = BodyGesturesConfig.SLOUCH_NOSE_DROP_NORM
+    SLOUCH_HIP_FORWARD_NORM:   float = BodyGesturesConfig.SLOUCH_HIP_FORWARD_NORM
 
     # ── Behaviour 4 : Bounding (large body displacement) ──────────────────
-    BOUND_DISP_NORM:      float = 0.25
-    BOUND_CONFIRM_FRAMES: int   = 3
-    BOUND_DECAY_FRAMES:   int   = 8
-    BOUND_HISTORY_LEN:    int   = 5
+    BOUND_DISP_NORM:      float = BodyGesturesConfig.BOUND_DISP_NORM
+    BOUND_CONFIRM_FRAMES: int   = BodyGesturesConfig.BOUND_CONFIRM_FRAMES
+    BOUND_DECAY_FRAMES:   int   = BodyGesturesConfig.BOUND_DECAY_FRAMES
+    BOUND_HISTORY_LEN:    int   = BodyGesturesConfig.BOUND_HISTORY_LEN
 
     # ── Behaviour 5 : Hand raise ───────────────────────────────────────────
-    HAND_ABOVE_MARGIN_NORM: float = 0.08
-    ELBOW_ABOVE_SHOULDER:   bool  = True
-    HAND_VEL_NORM:          float = 0.06
-    HAND_RAISE_HOLD:        int   = 6
-    HAND_LOWER_HOLD:        int   = 15
+    HAND_ABOVE_MARGIN_NORM: float = BodyGesturesConfig.HAND_ABOVE_MARGIN_NORM
+    ELBOW_ABOVE_SHOULDER:   bool  = BodyGesturesConfig.ELBOW_ABOVE_SHOULDER
+    HAND_VEL_NORM:          float = BodyGesturesConfig.HAND_VEL_NORM
+    HAND_RAISE_HOLD:        int   = BodyGesturesConfig.HAND_RAISE_HOLD
+    HAND_LOWER_HOLD:        int   = BodyGesturesConfig.HAND_LOWER_HOLD
 
 
 # ==============================================================================
